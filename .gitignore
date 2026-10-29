@@ -1,0 +1,45 @@
+# Environment & Secrets
+.env
+.env.local
+
+# Runtime Data & Caches
+tracks_cache.json
+tracks_cache.json.gz
+tracks_cache.json.gz.tmp
+tracks_cache.json.gz.bak
+
+# Zip & Archive files
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.img
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Cloudflared bin
+bin/
