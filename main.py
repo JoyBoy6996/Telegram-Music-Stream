@@ -236,13 +236,18 @@ async def stop_cloudflare_tunnel() -> None:
 async def background_indexer() -> None:
     """Background task to index tracks, deduplicate library, and refresh search engine index."""
     await telegram_manager.index_tracks()
-    from duplicates import deduplicate_library
+    from duplicates import deduplicate_library, recover_pending
+    await recover_pending(
+        telegram_manager.client,
+        telegram_manager.channel_entity,
+        telegram_manager.track_index,
+    )
     result = await deduplicate_library(
         telegram_manager.track_index,
         telegram_manager.client,
         telegram_manager.channel_entity,
     )
-    _log("DEDUPE", f"Complete: kept {result['kept']}, removed {result['removed']}")
+    _log("DEDUPE", f"Queued {result['queued']} deletions from {result['audited']} candidates")
     telegram_manager.save_cache()
     search_engine.track_index = telegram_manager.track_index
     search_engine._initialized = False
@@ -674,9 +679,17 @@ async def refresh_index() -> dict[str, str]:
     return {"status": "indexing"}
 
 
-@router.get("/deduplicate")
-async def trigger_deduplicate() -> dict[str, str]:
-    """Trigger deduplicate_library() as background task, returns immediately."""
+@router.get("/deduplicate/preview")
+async def deduplicate_preview() -> dict[str, Any]:
+    """Run audit_library(), return candidates list, NO deletion."""
+    from duplicates import audit_library
+    candidates = await audit_library(telegram_manager.track_index)
+    return {"candidates": candidates}
+
+
+@router.post("/deduplicate/run")
+async def deduplicate_run() -> dict[str, str]:
+    """Trigger deduplicate_library() as background task."""
     async def run_dedupe() -> None:
         from duplicates import deduplicate_library
         result = await deduplicate_library(
@@ -684,13 +697,28 @@ async def trigger_deduplicate() -> dict[str, str]:
             telegram_manager.client,
             telegram_manager.channel_entity,
         )
-        _log("DEDUPE", f"Complete: kept {result['kept']}, removed {result['removed']}")
+        _log("DEDUPE", f"Queued {result['queued']} deletions from {result['audited']} candidates")
         telegram_manager.save_cache()
         search_engine.track_index = telegram_manager.track_index
         search_engine._initialized = False
 
     asyncio.create_task(run_dedupe())
-    return {"status": "deduplication started"}
+    return {"status": "started"}
+
+
+@router.get("/deduplicate/pending")
+async def deduplicate_pending() -> dict[str, Any]:
+    """Load and return pending_deletions.json."""
+    from duplicates import load_pending
+    return {"pending": load_pending()}
+
+
+@router.post("/deduplicate/keep/{candidate_id}")
+async def deduplicate_keep(candidate_id: str) -> dict[str, str]:
+    """Call keep_track(candidate_id)."""
+    from duplicates import keep_track
+    status = await keep_track(candidate_id)
+    return {"status": "cancelled" if status else "not_found"}
 
 
 # Mount routes: under /{URL_SECRET}/ if set, else under /
