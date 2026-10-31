@@ -46,6 +46,16 @@ def _log(type_: str, msg: str) -> None:
     print(f"{ts} | {type_:^8} | {msg}")
 
 
+def get_session_key(request: Request) -> str:
+    """Extract client IP session key from request."""
+    if request.client and request.client.host:
+        return request.client.host
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return "127.0.0.1"
+
+
 # RAM limits configuration
 FAST_START_BYTES = 512 * 1024       # 512 KB
 TAG_SLICE_BYTES = 256 * 1024        # 256 KB
@@ -137,21 +147,21 @@ def format_track_for_client(track: dict[str, Any], base_url: str) -> dict[str, A
     return result
 
 
-async def prewarm_track(track_id: str) -> None:
-    """Pre-warm fastStartCache (512KB) and tagSliceCache (256KB) in background."""
+async def prewarm_track(track_id: str, session_key: str = "127.0.0.1") -> None:
+    """Pre-warm fastStartCache (512KB) and tagSliceCache (256KB) in background using user session's bot."""
     if await fast_start_cache.has(track_id):
         return
 
-    lease = bot_pool.acquire()
-    dl_client = lease.bot["client"] if lease else telegram_manager.client
-    bot_ref = lease.bot if lease else None
+    lease = bot_pool.acquire_for_session(session_key)
+    if not lease:
+        return
+
+    _log("BOTPOOL", f"{lease.bot['id']} -> prewarm {track_id}")
+    dl_client = lease.bot["client"]
+    bot_ref = lease.bot
 
     try:
-        if lease:
-            media = await bot_pool.get_media(lease.bot, track_id)
-        else:
-            media = await telegram_manager.get_media(track_id)
-
+        media = await bot_pool.get_media(lease.bot, track_id)
         if not media or not dl_client:
             return
 
@@ -176,9 +186,6 @@ async def prewarm_track(track_id: str) -> None:
     except Exception as exc:
         if bot_ref:
             bot_pool.report_error(bot_ref, exc)
-    finally:
-        if lease:
-            lease.release()
 
 
 async def start_cloudflare_tunnel(port: int) -> None:
@@ -366,12 +373,16 @@ async def search_tracks(
 ) -> dict[str, Any]:
     t0 = time.time()
     base = get_base_url(request)
+    session_key = get_session_key(request)
     atmos_preferred = atmos in {"auto", "true"}
     matches = search_engine.search(query=q, atmos_preferred=atmos_preferred, duration=duration)
     ms = round((time.time() - t0) * 1000)
     _log("SEARCH", f'"{q}" ({len(matches)} hits, {ms}ms) -> ID: {matches[0]["id"] if matches else "none"}')
     if matches:
-        asyncio.create_task(prewarm_track(str(matches[0]["id"])))
+        top_id = str(matches[0]["id"])
+        existing = await fast_start_cache.get(top_id)
+        if not existing or len(existing) < FAST_START_BYTES:
+            asyncio.create_task(prewarm_track(top_id, session_key))
     return {
         "tracks": [format_track_for_client(t, base) for t in matches],
     }
@@ -398,9 +409,6 @@ async def get_stream_info(track_id: str, request: Request) -> dict[str, Any]:
     tier, _, _ = determine_quality_tier(track)
     is_atmos = bool(track.get("isAtmos") or tier == "DOLBY_ATMOS")
 
-    # Trigger prewarm of fastStartCache in background
-    asyncio.create_task(prewarm_track(track_id))
-
     return {
         "url": f"{base}/audio/{track_id}",
         "format": "eac3-joc" if is_atmos else (track.get("format") or "flac"),
@@ -421,99 +429,93 @@ async def get_stream_info(track_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/artwork/{track_id}")
 async def get_artwork(track_id: str) -> Response:
-    """Serve album artwork thumbnail: PhotoStrippedSize or downloaded thumb bytes."""
-    media = await telegram_manager.get_media(track_id)
-    if not media:
-        raise HTTPException(status_code=404, detail="Media not found")
+    """Serve album artwork thumbnail: PhotoStrippedSize or downloaded thumb bytes via bot."""
+    lease = bot_pool.acquire()
+    if not lease:
+        raise HTTPException(status_code=503, detail="Bots currently unavailable")
 
-    doc = getattr(media, "document", None)
-    thumbs = getattr(doc, "thumbs", []) or []
-    if not thumbs:
-        raise HTTPException(status_code=404, detail="No artwork thumbnail")
+    try:
+        media = await bot_pool.get_media(lease.bot, track_id)
+        if not media:
+            raise HTTPException(status_code=404, detail="Media not found")
 
-    # Check for PhotoStrippedSize (instant zero-download return)
-    stripped = next((t for t in thumbs if isinstance(t, PhotoStrippedSize)), None)
-    if stripped:
-        jpg_bytes = stripped_photo_to_jpg(stripped.bytes)
+        doc = getattr(media, "document", None)
+        thumbs = getattr(doc, "thumbs", []) or []
+        if not thumbs:
+            raise HTTPException(status_code=404, detail="No artwork thumbnail")
+
+        # Check for PhotoStrippedSize (instant zero-download return)
+        stripped = next((t for t in thumbs if isinstance(t, PhotoStrippedSize)), None)
+        if stripped:
+            jpg_bytes = stripped_photo_to_jpg(stripped.bytes)
+            return Response(
+                content=jpg_bytes,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
+        # Download thumbnail via bot lease
+        thumb_buf: Optional[bytes] = None
+        try:
+            thumb_buf = await lease.bot["client"].download_media(media, file=bytes, thumb=0)
+        except FileReferenceExpiredError:
+            bot_media = await bot_pool.get_media(lease.bot, track_id, force=True)
+            if bot_media:
+                thumb_buf = await lease.bot["client"].download_media(bot_media, file=bytes, thumb=0)
+
+        if not thumb_buf:
+            raise HTTPException(status_code=404, detail="Artwork not available")
+
         return Response(
-            content=jpg_bytes,
+            content=thumb_buf,
             media_type="image/jpeg",
             headers={"Cache-Control": "public, max-age=86400"},
         )
-
-    # Download thumbnail via bot lease or user client fallback
-    thumb_buf: Optional[bytes] = None
-    lease = bot_pool.acquire()
-
-    if lease:
-        try:
-            bot_media = await bot_pool.get_media(lease.bot, track_id)
-            if bot_media:
-                try:
-                    thumb_buf = await lease.bot["client"].download_media(bot_media, file=bytes, thumb=0)
-                except FileReferenceExpiredError:
-                    bot_media = await bot_pool.get_media(lease.bot, track_id, force=True)
-                    if bot_media:
-                        thumb_buf = await lease.bot["client"].download_media(bot_media, file=bytes, thumb=0)
-        except Exception as exc:
-            bot_pool.report_error(lease.bot, exc)
-        finally:
-            lease.release()
-
-    if not thumb_buf:
-        try:
-            thumb_buf = await telegram_manager.client.download_media(media, file=bytes, thumb=0)
-        except FileReferenceExpiredError:
-            fresh_media = await telegram_manager.get_media(track_id, force=True)
-            if fresh_media:
-                thumb_buf = await telegram_manager.client.download_media(fresh_media, file=bytes, thumb=0)
-
-    if not thumb_buf:
-        raise HTTPException(status_code=404, detail="Artwork not available")
-
-    return Response(
-        content=thumb_buf,
-        media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    finally:
+        lease.release()
 
 
 @router.get("/audio/{track_id}")
 async def stream_audio(
     track_id: str,
+    request: Request,
     range: Optional[str] = Header(None),
 ) -> Response:
-    """Stream audio document with HTTP 206 Range support, fast start caching, and bot load-balancing."""
+    """Stream audio document with HTTP 206 Range support, fast start caching, and session-based bot leasing."""
+    session_key = get_session_key(request)
+
     # 1. Check metadata and total size
     track = next((t for t in telegram_manager.track_index if str(t["id"]) == track_id), None)
     total_size = int(track.get("fileSize", 0)) if track else 0
 
-    # 2. Acquire bot lease
-    lease: Optional[BotLease] = bot_pool.acquire()
-    dl_client = lease.bot["client"] if lease else telegram_manager.client
-    bot_ref = lease.bot if lease else None
+    # 2. Acquire bot lease for user session
+    lease: Optional[BotLease] = bot_pool.acquire_for_session(session_key)
+    if not lease:
+        raise HTTPException(
+            status_code=503,
+            detail="All bots are currently busy. Please wait and try again.",
+        )
 
-    # 4. Resolve media
-    if lease:
-        media = await bot_pool.get_media(lease.bot, track_id)
-    else:
-        media = await telegram_manager.get_media(track_id)
+    dl_client = lease.bot["client"]
+    bot_ref = lease.bot
 
+    # 3. Resolve media via dedicated bot
+    media = await bot_pool.get_media(lease.bot, track_id)
     if not media:
-        if lease:
-            lease.release()
+        bot_pool.release_session(session_key)
         raise HTTPException(status_code=404, detail="Media not found")
+
+    _log("BOTPOOL", f"{lease.bot['id']} -> track {track_id}")
 
     doc = getattr(media, "document", None)
     if not total_size and doc:
         total_size = int(getattr(doc, "size", 0) or 0)
 
     if not total_size:
-        if lease:
-            lease.release()
+        bot_pool.release_session(session_key)
         raise HTTPException(status_code=500, detail="Unable to determine audio file size")
 
-    # 1. Parse Range header -> start, end bytes
+    # 4. Parse Range header -> start, end bytes
     start = 0
     end = total_size - 1
     is_range = False
@@ -533,8 +535,7 @@ async def stream_audio(
                 is_range = True
 
     if is_range and (start >= total_size or start > end):
-        if lease:
-            lease.release()
+        bot_pool.release_session(session_key)
         return Response(
             status_code=416,
             headers={"Content-Range": f"bytes */{total_size}"},
@@ -568,9 +569,9 @@ async def stream_audio(
     elif not is_range:
         _log("PRECACHE", f'{track["title"]} • {_fmt_quality(track)} • {_fmt_size(total_size)} ({_fmt_duration(track.get("duration"))}) -> 200 OK')
 
-    # 9. Async streaming generator
+    # 5. Async streaming generator
     async def audio_generator() -> AsyncGenerator[bytes, None]:
-        nonlocal lease, dl_client, media, bot_ref
+        nonlocal dl_client, media, bot_ref, session_key
         bytes_sent = 0
 
         try:
@@ -645,26 +646,9 @@ async def stream_audio(
                     if bot_ref and (is_file_ref or is_flood):
                         bot_pool.report_error(bot_ref, exc)
 
-                    if not refreshed and is_file_ref:
+                    if not refreshed and is_file_ref and bot_ref:
                         refreshed = True
-                        if bot_ref:
-                            media = await bot_pool.get_media(bot_ref, track_id, force=True)
-                        else:
-                            media = await telegram_manager.get_media(track_id, force=True)
-                        if media:
-                            current_pos = start + bytes_sent
-                            aligned_start = (current_pos // REQUEST_CHUNK_SIZE) * REQUEST_CHUNK_SIZE
-                            alignment_gap = current_pos - aligned_start
-                            continue
-
-                    # Fallback to user client if bot failed
-                    if bot_ref:
-                        if lease:
-                            lease.release()
-                            lease = None
-                        bot_ref = None
-                        dl_client = telegram_manager.client
-                        media = await telegram_manager.get_media(track_id, force=True)
+                        media = await bot_pool.get_media(bot_ref, track_id, force=True)
                         if media:
                             current_pos = start + bytes_sent
                             aligned_start = (current_pos // REQUEST_CHUNK_SIZE) * REQUEST_CHUNK_SIZE
@@ -673,10 +657,7 @@ async def stream_audio(
 
                     raise exc
         finally:
-            # 12. Release bot lease
-            if lease:
-                lease.release()
-                lease = None
+            bot_pool.release_session(session_key)
 
     status_code = 206 if is_range else 200
     return StreamingResponse(
