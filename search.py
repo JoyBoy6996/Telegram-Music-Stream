@@ -1,3 +1,4 @@
+from itertools import combinations
 import re
 from typing import Any, Optional
 
@@ -38,12 +39,22 @@ class SearchEngine:
     def __init__(self, track_index: list[dict[str, Any]]) -> None:
         self.track_index = track_index
         self._initialized = False
+        self._inverted: dict[str, set[str]] = {}
+        self._tracks_by_id: dict[str, dict[str, Any]] = {}
 
     def _ensure_search_words(self) -> None:
-        """Lazily build _search_words frozenset on each track on first search."""
+        """Lazily build _search_words, inverted index, and ID lookup on first search."""
         if self._initialized:
             return
+
+        self._inverted = {}
+        self._tracks_by_id = {}
+
         for track in self.track_index:
+            track_id = str(track["id"])
+            self._tracks_by_id[track_id] = track
+            self._tracks_by_id[track["id"]] = track
+
             if "_search_words" not in track:
                 title = track.get("title", "")
                 artist = track.get("artist", "")
@@ -59,6 +70,12 @@ class SearchEngine:
                     words.add(str(isrc).lower().strip())
 
                 track["_search_words"] = frozenset(words)
+
+            for token in track["_search_words"]:
+                if token not in self._inverted:
+                    self._inverted[token] = set()
+                self._inverted[token].add(track_id)
+
         self._initialized = True
 
     def search(
@@ -67,7 +84,7 @@ class SearchEngine:
         atmos_preferred: bool = False,
         duration: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        """Search tracks with 2-phase filtering and scoring."""
+        """Search tracks with tiered inverted index filtering and scoring."""
         self._ensure_search_words()
 
         clean_query = query.strip().lower()
@@ -84,19 +101,42 @@ class SearchEngine:
         if not query_tokens:
             return self.track_index[:20]
 
-        query_tokens_set = set(query_tokens)
         query_core = extract_core_title(clean_query)
 
-        # Phase 1: Fast Token Filter
-        candidates: list[dict[str, Any]] = []
-        for track in self.track_index:
-            track_words: frozenset[str] = track.get("_search_words", frozenset())
-            # Keep tracks where any query token matches any track token
-            if any(q_tok in track_words for q_tok in query_tokens):
-                candidates.append(track)
+        # Phase 1: Tiered Inverted Index Token Filter
+        candidate_ids: set[str] = set()
 
-        # Fallback to full index if no candidates matched
-        pool = candidates if candidates else self.track_index
+        if len(query_tokens) == 1:
+            # Single-word queries always use union (all tracks containing the token)
+            tok = query_tokens[0]
+            if tok in self._inverted:
+                candidate_ids = set(self._inverted[tok])
+        else:
+            # 1. Try strict intersection of ALL tokens first
+            if all(tok in self._inverted for tok in query_tokens):
+                candidate_ids = set.intersection(*(self._inverted[tok] for tok in query_tokens))
+
+            # 2. If results < 3: try intersection of any 2 tokens
+            if len(candidate_ids) < 3 and len(query_tokens) >= 2:
+                pair_matches: set[str] = set()
+                for t1, t2 in combinations(query_tokens, 2):
+                    if t1 in self._inverted and t2 in self._inverted:
+                        pair_matches.update(self._inverted[t1] & self._inverted[t2])
+                if pair_matches:
+                    candidate_ids.update(pair_matches)
+
+            # 3. If still empty: fall back to union
+            if not candidate_ids:
+                matching_sets = [self._inverted[tok] for tok in query_tokens if tok in self._inverted]
+                if matching_sets:
+                    candidate_ids = set.union(*matching_sets)
+
+        # 4. If still empty: use full track_index as candidates
+        if candidate_ids:
+            candidates = [self._tracks_by_id[tid] for tid in candidate_ids if tid in self._tracks_by_id]
+            pool = candidates if candidates else self.track_index
+        else:
+            pool = self.track_index
 
         # Phase 2: Scoring
         scored: list[tuple[int, bool, dict[str, Any]]] = []
