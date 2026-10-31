@@ -1,8 +1,10 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime
 import io
 import os
 import re
+import time
 from typing import Any, AsyncGenerator, Optional
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,12 +20,38 @@ from config import config
 from search import SearchEngine
 from telegram_client import format_artist_for_client, telegram_manager
 
-# RAM limits configuration
-FAST_START_BYTES = 3 * 1024 * 1024  # 3 MB
-TAG_SLICE_BYTES = 256 * 1024        # 256 KB
-REQUEST_CHUNK_SIZE = 64 * 1024      # 64 KB
 
-fast_start_cache = SimpleLRU(50)    # 50 x 3MB = 150MB max
+def _fmt_size(b: int) -> str:
+    return f"{b / 1024 / 1024:.1f} MB"
+
+
+def _fmt_duration(seconds) -> str:
+    if not seconds:
+        return "?:??"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}m"
+
+
+def _fmt_quality(track: dict) -> str:
+    fmt = (track.get("format") or "").upper()
+    bd = track.get("bitDepth") or 16
+    sr = (track.get("sampleRate") or 44100) / 1000
+    if track.get("isAtmos"):
+        return "Dolby Atmos"
+    return f"{bd}-bit / {sr:.1f}kHz {fmt}"
+
+
+def _log(type_: str, msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{ts} | {type_:^8} | {msg}")
+
+
+# RAM limits configuration
+FAST_START_BYTES = 512 * 1024       # 512 KB
+TAG_SLICE_BYTES = 256 * 1024        # 256 KB
+REQUEST_CHUNK_SIZE = 256 * 1024     # 256 KB
+
+fast_start_cache = SimpleLRU(50)    # 50 x 512KB = ~25MB max
 tag_slice_cache = SimpleLRU(200)    # 200 x 256KB = 50MB max
 
 bot_pool = BotPool(
@@ -76,12 +104,9 @@ def determine_quality_tier(track: dict[str, Any]) -> tuple[str, bool, bool]:
 
 def format_track_for_client(track: dict[str, Any], base_url: str) -> dict[str, Any]:
     """Format internal track dictionary into client schema matching BitChord / Stremio."""
-    tier, _, is_hires = determine_quality_tier(track)
+    tier, _, _ = determine_quality_tier(track)
     is_atmos = bool(track.get("isAtmos") or tier == "DOLBY_ATMOS")
     track_id = str(track["id"])
-
-    bit_depth = track.get("bitDepth") or (24 if is_hires else 16)
-    sample_rate = track.get("sampleRate") or (96000 if is_hires else 44100)
 
     result: dict[str, Any] = {
         "id": track_id,
@@ -93,29 +118,27 @@ def format_track_for_client(track: dict[str, Any], base_url: str) -> dict[str, A
         "audioQuality": tier,
         "quality": tier,
         "tier": tier,
-        "bitDepth": bit_depth,
-        "sampleRate": sample_rate,
+        "bitDepth": track.get("bitDepth") or 16,
+        "sampleRate": track.get("sampleRate") or 44100,
         "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
-        "stream": f"{base_url}/stream/{track_id}",
-        "streamURL": f"{base_url}/audio/{track_id}",
-        "streamUrl": f"{base_url}/audio/{track_id}",
-        "audio": f"{base_url}/audio/{track_id}",
-        "audioUrl": f"{base_url}/audio/{track_id}",
+        "stream": f"{base_url}/stream/{track['id']}",
+        "streamURL": f"{base_url}/audio/{track['id']}",
+        "streamUrl": f"{base_url}/audio/{track['id']}",
+        "audio": f"{base_url}/audio/{track['id']}",
+        "audioUrl": f"{base_url}/audio/{track['id']}",
+        "artworkURL": f"{base_url}/artwork/{track['id']}" if track.get("hasArtwork") else None,
+        "albumArtworkURL": f"{base_url}/artwork/{track['id']}" if track.get("hasArtwork") else None,
         "isrc": track.get("isrc"),
     }
 
     if is_atmos:
         result["atmos"] = True
 
-    if track.get("hasArtwork"):
-        result["artworkURL"] = f"{base_url}/artwork/{track_id}"
-        result["albumArtworkURL"] = f"{base_url}/artwork/{track_id}"
-
     return result
 
 
 async def prewarm_track(track_id: str) -> None:
-    """Pre-warm fastStartCache (3MB) and tagSliceCache (256KB) in background."""
+    """Pre-warm fastStartCache (512KB) and tagSliceCache (256KB) in background."""
     if await fast_start_cache.has(track_id):
         return
 
@@ -204,8 +227,16 @@ async def stop_cloudflare_tunnel() -> None:
 
 
 async def background_indexer() -> None:
-    """Background task to index tracks and refresh the search engine index."""
+    """Background task to index tracks, deduplicate library, and refresh search engine index."""
     await telegram_manager.index_tracks()
+    from duplicates import deduplicate_library
+    result = await deduplicate_library(
+        telegram_manager.track_index,
+        telegram_manager.client,
+        telegram_manager.channel_entity,
+    )
+    _log("DEDUPE", f"Complete: kept {result['kept']}, removed {result['removed']}")
+    telegram_manager.save_cache()
     search_engine.track_index = telegram_manager.track_index
     search_engine._initialized = False
 
@@ -333,9 +364,14 @@ async def search_tracks(
     atmos: str = Query("auto", description="Atmos preference: auto | off"),
     duration: Optional[int] = Query(None, description="Target duration in seconds"),
 ) -> dict[str, Any]:
+    t0 = time.time()
     base = get_base_url(request)
     atmos_preferred = atmos in {"auto", "true"}
     matches = search_engine.search(query=q, atmos_preferred=atmos_preferred, duration=duration)
+    ms = round((time.time() - t0) * 1000)
+    _log("SEARCH", f'"{q}" ({len(matches)} hits, {ms}ms) -> ID: {matches[0]["id"] if matches else "none"}')
+    if matches:
+        asyncio.create_task(prewarm_track(str(matches[0]["id"])))
     return {
         "tracks": [format_track_for_client(t, base) for t in matches],
     }
@@ -356,6 +392,8 @@ async def get_stream_info(track_id: str, request: Request) -> dict[str, Any]:
     track = next((t for t in telegram_manager.track_index if str(t["id"]) == track_id), None)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
+
+    _log("STREAM", f'{track["title"]} • {_fmt_quality(track)} • {_fmt_size(track.get("fileSize", 0))} ({_fmt_duration(track.get("duration"))}) -> 206 Partial')
 
     tier, _, _ = determine_quality_tier(track)
     is_atmos = bool(track.get("isAtmos") or tier == "DOLBY_ATMOS")
@@ -521,6 +559,15 @@ async def stream_audio(
     if is_range:
         headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
 
+    if start == 0 and not await fast_start_cache.has(track_id):
+        _log("PROBE", f'{track["title"]} (64 KB header read)')
+
+    if is_range and start > 0:
+        pct = round(start / total_size * 100) if total_size else 0
+        _log("SEEK", f'{track["title"]} • Seeked to ~{_fmt_duration(start // (total_size // max(track.get("duration",1),1))*1 if total_size else 0)} ({pct}%) • {_fmt_size(start)}')
+    elif not is_range:
+        _log("PRECACHE", f'{track["title"]} • {_fmt_quality(track)} • {_fmt_size(total_size)} ({_fmt_duration(track.get("duration"))}) -> 200 OK')
+
     # 9. Async streaming generator
     async def audio_generator() -> AsyncGenerator[bytes, None]:
         nonlocal lease, dl_client, media, bot_ref
@@ -555,7 +602,7 @@ async def stream_audio(
                         offset=aligned_start,
                         request_size=REQUEST_CHUNK_SIZE,
                     ):
-                        # Collect first 3MB for fastStartCache and first 256KB for tagSliceCache
+                        # Collect first 512KB for fastStartCache and first 256KB for tagSliceCache
                         if start == 0 and collector_size < FAST_START_BYTES:
                             needed_cache = FAST_START_BYTES - collector_size
                             c_slice = chunk[:needed_cache]
@@ -565,6 +612,7 @@ async def stream_audio(
                                 full_p = b"".join(preamble_collector)
                                 await fast_start_cache.set(track_id, full_p)
                                 await tag_slice_cache.set(track_id, full_p[:TAG_SLICE_BYTES])
+                                _log("BUFFER", f'Prewarmed {_fmt_size(collector_size)} -> ID: {track_id}')
 
                         # Skip initial alignment gap
                         usable_chunk = chunk
@@ -645,6 +693,25 @@ async def refresh_index() -> dict[str, str]:
     return {"status": "indexing"}
 
 
+@router.get("/deduplicate")
+async def trigger_deduplicate() -> dict[str, str]:
+    """Trigger deduplicate_library() as background task, returns immediately."""
+    async def run_dedupe() -> None:
+        from duplicates import deduplicate_library
+        result = await deduplicate_library(
+            telegram_manager.track_index,
+            telegram_manager.client,
+            telegram_manager.channel_entity,
+        )
+        _log("DEDUPE", f"Complete: kept {result['kept']}, removed {result['removed']}")
+        telegram_manager.save_cache()
+        search_engine.track_index = telegram_manager.track_index
+        search_engine._initialized = False
+
+    asyncio.create_task(run_dedupe())
+    return {"status": "deduplication started"}
+
+
 # Mount routes: under /{URL_SECRET}/ if set, else under /
 if config.clean_url_secret:
     app.include_router(router, prefix=f"/{config.clean_url_secret}")
@@ -656,5 +723,16 @@ else:
 
 
 if __name__ == "__main__":
+    import logging
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=config.PORT, workers=1)
+
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=config.PORT,
+        workers=1,
+        access_log=False,
+        log_level="warning",
+    )

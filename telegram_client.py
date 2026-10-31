@@ -1,11 +1,12 @@
 import asyncio
+from datetime import datetime
 import gzip
 import io
 import os
 import re
 from typing import Any, Optional
 import orjson
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Document,
@@ -53,6 +54,12 @@ COMPOSER_DUOS = [
 ]
 
 
+def _log(type_: str, msg: str) -> None:
+    """Format and print a timestamped log message."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{ts} | {type_:^8} | {msg}")
+
+
 def format_artist_for_client(artist_str: Optional[str]) -> str:
     """Format artist names, expanding known composer duos and cleaning delimiters."""
     if not artist_str or artist_str.strip().lower() == "unknown artist":
@@ -97,6 +104,7 @@ class TelegramManager:
         self.media_cache = SimpleLRU(500)
         self.track_index: list[dict[str, Any]] = []
         self.is_indexing = False
+        self._handler_registered = False
         self._cache_file_gz = os.path.join(os.path.dirname(__file__), "tracks_cache.json.gz")
         self._cache_file_tmp = self._cache_file_gz + ".tmp"
 
@@ -116,6 +124,26 @@ class TelegramManager:
                 "Telegram session string is not authorized. Please run python login.py again."
             )
 
+    def register_event_handler(self) -> None:
+        """Register real-time NewMessage event listener for the channel."""
+        if self._handler_registered or not self.client or not self.channel_entity:
+            return
+
+        @self.client.on(events.NewMessage(chats=self.channel_entity))
+        async def on_new_message(event: Any) -> None:
+            msg = getattr(event, "message", None)
+            if not msg:
+                return
+            parsed = self._parse_track_message(msg)
+            if parsed:
+                from duplicates import check_new_track
+                res = await check_new_track(parsed, self.track_index, self.client, self.channel_entity)
+                if res:
+                    self.save_cache()
+                    _log("INDEX", f"New track added: {parsed['title']}")
+
+        self._handler_registered = True
+
     async def resolve_channel(self, ref: str | int) -> Any:
         """Resolve channel entity using multiple strategies: direct, @username, numeric ID, or dialog search."""
         if not self.client:
@@ -130,6 +158,7 @@ class TelegramManager:
         try:
             entity = await self.client.get_entity(target)
             self.channel_entity = entity
+            self.register_event_handler()
             return entity
         except Exception:
             pass
@@ -139,6 +168,7 @@ class TelegramManager:
             try:
                 entity = await self.client.get_entity(f"@{target}")
                 self.channel_entity = entity
+                self.register_event_handler()
                 return entity
             except Exception:
                 pass
@@ -146,6 +176,7 @@ class TelegramManager:
             try:
                 entity = await self.client.get_entity(target[1:])
                 self.channel_entity = entity
+                self.register_event_handler()
                 return entity
             except Exception:
                 pass
@@ -158,6 +189,7 @@ class TelegramManager:
                 try:
                     entity = await self.client.get_entity(variation)
                     self.channel_entity = entity
+                    self.register_event_handler()
                     return entity
                 except Exception:
                     pass
@@ -181,6 +213,7 @@ class TelegramManager:
                     or title == clean_lower
                 ):
                     self.channel_entity = ent
+                    self.register_event_handler()
                     return ent
         except Exception:
             pass
@@ -257,6 +290,10 @@ class TelegramManager:
         if is_atmos:
             format_name = "eac3-joc"
 
+        if format_name in {"flac", "alac", "wav"} and not is_atmos:
+            bit_depth = 16
+            sample_rate = 44100
+
         # Quality text calculation
         if is_atmos:
             quality_text = "Dolby Atmos"
@@ -269,6 +306,12 @@ class TelegramManager:
                 if format_name == "mp3" and raw_kbps > 320:
                     raw_kbps = 320
             quality_text = f"{format_name.upper()} ({raw_kbps}kbps)"
+
+        keep = bool(
+            "/keep" in msg_text.lower()
+            or "/ig" in msg_text.lower()
+            or "#keep" in msg_text.lower()
+        )
 
         return {
             "id": str(msg.id),
@@ -286,6 +329,7 @@ class TelegramManager:
             "quality": quality_text,
             "hasArtwork": has_artwork,
             "isrc": None,
+            "keep": keep,
         }
 
     async def index_tracks(self) -> list[dict[str, Any]]:
@@ -328,6 +372,7 @@ class TelegramManager:
 
             self.track_index = new_index
             self.save_cache()
+            self.register_event_handler()
             print(f"[Indexer] Indexing complete: {len(self.track_index)} tracks loaded.")
             return self.track_index
         except Exception as exc:
