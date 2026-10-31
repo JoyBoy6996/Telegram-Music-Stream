@@ -225,7 +225,7 @@ def compare_tracks(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
             "safe_to_auto_delete": False,
         }
 
-    # 3. ISRC check:
+    # 3. ISRC check: +0.40 bonus (not required)
     isrc_a = str(a.get("isrc") or "").strip().upper()
     isrc_b = str(b.get("isrc") or "").strip().upper()
     if isrc_a and isrc_b and isrc_a == isrc_b:
@@ -235,10 +235,10 @@ def compare_tracks(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
             or prof_a["version_type"] == "unknown"
             or prof_b["version_type"] == "unknown"
         ):
-            confidence += 0.6
+            confidence += 0.40
             matched_by.append("isrc")
 
-    # 4. Artist check:
+    # 4. Artist check: Exact artist token match: +0.30
     result_art = artist_match(a, b)
     if result_art == "CONFLICT":
         return {
@@ -249,33 +249,41 @@ def compare_tracks(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
             "safe_to_auto_delete": False,
         }
     elif result_art == "MATCH":
-        confidence += 0.2
+        confidence += 0.30
         matched_by.append("artist")
 
     # 5. Title check:
+    # Exact title match: +0.35
+    # Core title match: +0.20
     norm_a = normalize_title(a.get("title", ""))
     norm_b = normalize_title(b.get("title", ""))
     core_a = get_core_title(a.get("title", ""))
     core_b = get_core_title(b.get("title", ""))
 
     if norm_a and norm_b and norm_a == norm_b:
-        confidence += 0.3
+        confidence += 0.35
         matched_by.append("exact_title")
     elif core_a and core_b and core_a == core_b:
-        confidence += 0.15
+        confidence += 0.20
         matched_by.append("core_title")
 
     # 6. Duration check:
+    # Duration <= 2s: +0.15
+    # Duration 3-5s: +0.05
+    # Duration > 5s: -0.30
     dur_a = a.get("duration")
     dur_b = b.get("duration")
     if dur_a is not None and dur_b is not None:
         try:
             diff = abs(float(dur_a) - float(dur_b))
             if diff <= 2:
-                confidence += 0.1
+                confidence += 0.15
                 matched_by.append("duration")
-            elif diff > 5:
-                confidence -= 0.3
+            elif diff <= 5:
+                confidence += 0.05
+                matched_by.append("duration")
+            else:
+                confidence -= 0.30
         except (ValueError, TypeError):
             pass
 
@@ -286,6 +294,7 @@ def compare_tracks(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     confidence = round(max(0.0, min(1.0, confidence)), 2)
 
     # 7. Final decision:
+    # Threshold for safe_to_auto_delete: 0.95
     if confidence >= 0.95:
         decision = "exact_duplicate"
         safe_to_auto_delete = True
@@ -593,31 +602,46 @@ async def _execute_deletion(
         cand_id_int = int(record["candidate_id"])
         keeper_id_int = int(record["keeper_id"])
 
-        # Re-fetch candidate message from Telegram
+        # FIX 2: Re-fetch candidate message from Telegram with separate try/except
         try:
-            cand_msgs = await tg_client.get_messages(channel_entity, ids=[cand_id_int])
-        except Exception as exc:
-            _log("DEDUPE", f"Error fetching candidate message {cand_id_int}: {exc}")
-            cand_msgs = None
+            cand_msgs = await tg_client.get_messages(
+                channel_entity, ids=[cand_id_int]
+            )
+        except Exception as fetch_err:
+            # Network or API error — NOT confirmed deletion
+            curr_record["status"] = "failed"
+            curr_record["last_error"] = str(fetch_err)
+            save_pending(records)
+            _log("DEDUPE", f"Fetch error for ID {record['candidate_id']}: {fetch_err} — retaining track")
+            return  # DO NOT remove from index, DO NOT mark completed
 
-        if not cand_msgs or not cand_msgs[0] or not getattr(cand_msgs[0], "media", None):
+        # Only reach here if fetch succeeded
+        cand_msg = cand_msgs[0] if cand_msgs else None
+        if cand_msg is None or getattr(cand_msg, "id", None) is None:
+            # Confirmed: message does not exist on Telegram
             curr_record["status"] = "completed"
             save_pending(records)
             for i, t in enumerate(track_index):
                 if str(t.get("id")) == str(record["candidate_id"]):
                     track_index.pop(i)
                     break
-            _log("DEDUPE", f"Candidate message ID {cand_id_int} already deleted from channel")
+            _log("DEDUPE", f"ID {record['candidate_id']} already gone from Telegram")
             return
 
-        # Re-fetch keeper message
+        # FIX 2: Re-fetch keeper message with separate try/except
         try:
-            keeper_msgs = await tg_client.get_messages(channel_entity, ids=[keeper_id_int])
-        except Exception as exc:
-            _log("DEDUPE", f"Error fetching keeper message {keeper_id_int}: {exc}")
-            keeper_msgs = None
+            keeper_msgs = await tg_client.get_messages(
+                channel_entity, ids=[keeper_id_int]
+            )
+        except Exception as fetch_err:
+            curr_record["status"] = "failed"
+            curr_record["last_error"] = str(fetch_err)
+            save_pending(records)
+            _log("DEDUPE", f"Keeper fetch error — cancelling deletion of {record['candidate_id']}: {fetch_err}")
+            return
 
-        if not keeper_msgs or not keeper_msgs[0] or not getattr(keeper_msgs[0], "media", None):
+        keeper_msg = keeper_msgs[0] if keeper_msgs else None
+        if keeper_msg is None or getattr(keeper_msg, "id", None) is None:
             curr_record["status"] = "failed"
             save_pending(records)
             _log("DEDUPE", f"Keeper ID {keeper_id_int} no longer found, cancelling deletion of ID: {record['candidate_id']}")
@@ -625,8 +649,8 @@ async def _execute_deletion(
 
         # Re-run compare_tracks on fresh metadata
         from telegram_client import telegram_manager
-        fresh_cand = telegram_manager._parse_track_message(cand_msgs[0])
-        fresh_keeper = telegram_manager._parse_track_message(keeper_msgs[0])
+        fresh_cand = telegram_manager._parse_track_message(cand_msg)
+        fresh_keeper = telegram_manager._parse_track_message(keeper_msg)
 
         if not fresh_cand or not fresh_keeper:
             curr_record["status"] = "cancelled"
