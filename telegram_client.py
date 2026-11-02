@@ -8,6 +8,7 @@ import time
 from typing import Any, Optional
 import orjson
 from telethon import TelegramClient, events, utils
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Document,
@@ -417,11 +418,15 @@ class TelegramManager:
                 seen_ids: set[str] = set()
                 existing_map = {str(t["id"]): t for t in self.track_index}
 
-                async for msg in self.client.iter_messages(self.channel_entity, reverse=True, wait_time=0):
+                async for msg in self.client.iter_messages(self.channel_entity, reverse=True):
                     msg_id_str = str(msg.id)
                     if msg_id_str in seen_ids:
                         continue
                     seen_ids.add(msg_id_str)
+
+                    # Pace every 100-message batch to prevent excessive requests and avoid FloodWait
+                    if len(seen_ids) % 100 == 0:
+                        await asyncio.sleep(0.05)
 
                     # Fast-path: non-document messages cannot be audio tracks
                     media = getattr(msg, "media", None)
@@ -459,6 +464,9 @@ class TelegramManager:
                 await self.save_cache()
                 self.register_event_handler()
                 print(f"[Indexer] Indexing complete: {len(self.track_index)} tracks loaded.")
+                return self.track_index
+            except FloodWaitError as fwe:
+                print(f"[Indexer] Telegram FloodWait encountered ({fwe.seconds}s). Retaining existing {len(self.track_index)} tracks.")
                 return self.track_index
             except Exception as exc:
                 print(f"[Indexer] Temporary error during track indexing: {exc}. Retaining existing {len(self.track_index)} tracks.")
