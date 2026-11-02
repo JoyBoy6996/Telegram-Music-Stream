@@ -1,0 +1,142 @@
+[1mdiff --git a/duplicates.py b/duplicates.py[m
+[1mindex 5935e7d..cebe88a 100644[m
+[1m--- a/duplicates.py[m
+[1m+++ b/duplicates.py[m
+[36m@@ -179,16 +179,17 @@[m [mdef is_atmos_track(track: dict[str, Any]) -> bool:[m
+ def is_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:[m
+     """Determine whether track a and track b are genuine duplicates.[m
+ [m
+[31m-    Safety principles enforced:[m
+[31m-    - Never delete across different IDs or when either is marked keep.[m
+[31m-    - Never delete across Atmos vs Stereo mixes.[m
+[31m-    - Never delete across different versions (Remix, Live, Acoustic, etc.).[m
+[31m-    - Exact token-based artist matching (NO substring matching).[m
+[31m-    - Unknown artists NEVER match unless verified by identical ISRC.[m
+[32m+[m[32m    A file is a duplicate ONLY if all four match:[m
+[32m+[m[32m    1. Filename (case-insensitive, ignoring extension).[m
+[32m+[m[32m    2. File extension (case-insensitive).[m
+[32m+[m[32m    3. File size (exact bytes).[m
+[32m+[m[32m    4. Track duration (exact value).[m
+[32m+[m
+[32m+[m[32m    If any condition differs or metadata is missing, return False (not duplicate).[m
+     """[m
+     id_a = str(a.get("id"))[m
+     id_b = str(b.get("id"))[m
+[31m-    if id_a == id_b:[m
+[32m+[m[32m    if not id_a or not id_b or id_a == id_b:[m
+         return False[m
+ [m
+     # Persistent /keep check[m
+[36m@@ -196,68 +197,64 @@[m [mdef is_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:[m
+     if a.get("keep") or id_a in kept_ids or b.get("keep") or id_b in kept_ids:[m
+         return False[m
+ [m
+[31m-    # Atmos vs Stereo protection[m
+[31m-    is_atmos_a = is_atmos_track(a)[m
+[31m-    is_atmos_b = is_atmos_track(b)[m
+[31m-    if is_atmos_a != is_atmos_b:[m
+[32m+[m[32m    # 1. Filename (case-insensitive, ignoring extension) & 2. File extension (case-insensitive)[m
+[32m+[m[32m    fn_a = a.get("fileName") or a.get("filename")[m
+[32m+[m[32m    fn_b = b.get("fileName") or b.get("filename")[m
+[32m+[m[32m    if not fn_a or not fn_b:[m
+         return False[m
+ [m
+[31m-    # Version protection: distinct musical arrangements must never be flagged as duplicates[m
+[31m-    tag_a = extract_version_tag(str(a.get("title") or ""))[m
+[31m-    tag_b = extract_version_tag(str(b.get("title") or ""))[m
+[31m-    if tag_a != tag_b:[m
+[31m-        return False[m
+[32m+[m[32m    name_a, ext_a = os.path.splitext(str(fn_a))[m
+[32m+[m[32m    name_b, ext_b = os.path.splitext(str(fn_b))[m
+ [m
+[31m-    # Exact ISRC match: identical master recording[m
+[31m-    isrc_a = str(a.get("isrc") or "").strip().upper()[m
+[31m-    isrc_b = str(b.get("isrc") or "").strip().upper()[m
+[31m-    if isrc_a and isrc_b and isrc_a == isrc_b:[m
+[31m-        return True[m
+[32m+[m[32m    ext_a = ext_a.lstrip(".").strip().lower()[m
+[32m+[m[32m    ext_b = ext_b.lstrip(".").strip().lower()[m
+ [m
+[31m-    # Duration check: reject if duration difference exceeds 15 seconds[m
+[31m-    dur_a = a.get("duration")[m
+[31m-    dur_b = b.get("duration")[m
+[31m-    if dur_a is not None and dur_b is not None:[m
+[31m-        try:[m
+[31m-            if abs(float(dur_a) - float(dur_b)) > 15:[m
+[31m-                return False[m
+[31m-        except (ValueError, TypeError):[m
+[31m-            pass[m
+[32m+[m[32m    if not ext_a:[m
+[32m+[m[32m        ext_a = (a.get("format") or "").strip().lower()[m
+[32m+[m[32m    if not ext_b:[m
+[32m+[m[32m        ext_b = (b.get("format") or "").strip().lower()[m
+ [m
+[31m-    # Title check[m
+[31m-    title_a = normalize_title(str(a.get("title") or ""))[m
+[31m-    title_b = normalize_title(str(b.get("title") or ""))[m
+[31m-    core_a = get_core_title(str(a.get("title") or ""))[m
+[31m-    core_b = get_core_title(str(b.get("title") or ""))[m
+[32m+[m[32m    name_a = name_a.strip().lower()[m
+[32m+[m[32m    name_b = name_b.strip().lower()[m
+ [m
+[31m-    if not title_a or not title_b:[m
+[32m+[m[32m    if not name_a or not name_b or not ext_a or not ext_b:[m
+         return False[m
+ [m
+[31m-    titles_match = ([m
+[31m-        title_a == title_b[m
+[31m-        or core_a == core_b[m
+[31m-        or title_a == core_b[m
+[31m-        or core_a == title_b[m
+[31m-    )[m
+[31m-[m
+[31m-    if not titles_match:[m
+[32m+[m[32m    # Check 1: Filename ignoring extension[m
+[32m+[m[32m    if name_a != name_b:[m
+         return False[m
+ [m
+[31m-    # Artist check: Token-based match (NO substring matching)[m
+[31m-    tokens_a = get_artist_tokens(str(a.get("artist") or ""))[m
+[31m-    tokens_b = get_artist_tokens(str(b.get("artist") or ""))[m
+[32m+[m[32m    # Check 2: File extension[m
+[32m+[m[32m    if ext_a != ext_b:[m
+[32m+[m[32m        return False[m
+ [m
+[31m-    # Unknown artist safety: NEVER classify unknown artists as duplicates without independent ISRC[m
+[31m-    if not tokens_a or not tokens_b:[m
+[32m+[m[32m    # Check 3: File size (exact bytes)[m
+[32m+[m[32m    size_a = a.get("fileSize") if a.get("fileSize") is not None else a.get("sizeBytes")[m
+[32m+[m[32m    size_b = b.get("fileSize") if b.get("fileSize") is not None else b.get("sizeBytes")[m
+[32m+[m[32m    if size_a is None or size_b is None:[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        int_size_a = int(size_a)[m
+[32m+[m[32m        int_size_b = int(size_b)[m
+[32m+[m[32m        if int_size_a <= 0 or int_size_b <= 0 or int_size_a != int_size_b:[m
+[32m+[m[32m            return False[m
+[32m+[m[32m    except (ValueError, TypeError):[m
+         return False[m
+ [m
+[31m-    # Both artists known: check exact token intersection[m
+[31m-    common_tokens = tokens_a & tokens_b[m
+[31m-    if common_tokens:[m
+[31m-        return True[m
+[32m+[m[32m    # Check 4: Track duration (exact value)[m
+[32m+[m[32m    dur_a = a.get("duration")[m
+[32m+[m[32m    dur_b = b.get("duration")[m
+[32m+[m[32m    if dur_a is None or dur_b is None:[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        f_dur_a = float(dur_a)[m
+[32m+[m[32m        f_dur_b = float(dur_b)[m
+[32m+[m[32m        if f_dur_a <= 0 or f_dur_b <= 0 or f_dur_a != f_dur_b:[m
+[32m+[m[32m            return False[m
+[32m+[m[32m    except (ValueError, TypeError):[m
+[32m+[m[32m        return False[m
+ [m
+[31m-    # If artists differ, close duration alone is insufficient[m
+[31m-    return False[m
+[32m+[m[32m    return True[m
+ [m
+ [m
+ isDuplicate = is_duplicate[m

@@ -70,6 +70,8 @@ class SearchEngine:
                     words.add(str(isrc).lower().strip())
 
                 track["_search_words"] = frozenset(words)
+            elif isinstance(track["_search_words"], (list, set)):
+                track["_search_words"] = frozenset(track["_search_words"])
 
             for token in track["_search_words"]:
                 if token not in self._inverted:
@@ -146,6 +148,8 @@ class SearchEngine:
             title_tokens = set(tokenize(title))
             artist_tokens = set(tokenize(track.get("artist")))
             track_words = track.get("_search_words", frozenset())
+            if not isinstance(track_words, (set, frozenset)):
+                track_words = frozenset(track_words) if track_words else frozenset()
             track_duration = track.get("duration")
             is_atmos = bool(track.get("isAtmos"))
 

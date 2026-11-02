@@ -152,7 +152,7 @@ async def prewarm_track(track_id: str, session_key: str = "127.0.0.1") -> None:
     if await fast_start_cache.has(track_id):
         return
 
-    lease = bot_pool.acquire_for_session(session_key)
+    lease = await bot_pool.acquire_for_session(session_key)
     if not lease:
         return
 
@@ -248,7 +248,7 @@ async def background_indexer() -> None:
         telegram_manager.channel_entity,
     )
     _log("DEDUPE", f"Queued {result['queued']} deletions from {result['audited']} candidates")
-    telegram_manager.save_cache()
+    await telegram_manager.save_cache()
     search_engine.track_index = telegram_manager.track_index
     search_engine._initialized = False
 
@@ -435,7 +435,7 @@ async def get_stream_info(track_id: str, request: Request) -> dict[str, Any]:
 @router.get("/artwork/{track_id}")
 async def get_artwork(track_id: str) -> Response:
     """Serve album artwork thumbnail: PhotoStrippedSize or downloaded thumb bytes via bot."""
-    lease = bot_pool.acquire()
+    lease = await bot_pool.acquire()
     if not lease:
         raise HTTPException(status_code=503, detail="Bots currently unavailable")
 
@@ -494,7 +494,7 @@ async def stream_audio(
     total_size = int(track.get("fileSize", 0)) if track else 0
 
     # 2. Acquire bot lease for user session
-    lease: Optional[BotLease] = bot_pool.acquire_for_session(session_key)
+    lease: Optional[BotLease] = await bot_pool.acquire_for_session(session_key)
     if not lease:
         raise HTTPException(
             status_code=503,
@@ -578,6 +578,7 @@ async def stream_audio(
     async def audio_generator() -> AsyncGenerator[bytes, None]:
         nonlocal dl_client, media, bot_ref, session_key
         bytes_sent = 0
+        bot_pool.mark_stream_start(bot_ref["id"])
 
         try:
             # Check fastStartCache for requested byte range
@@ -662,6 +663,7 @@ async def stream_audio(
 
                     raise exc
         finally:
+            bot_pool.mark_stream_end(bot_ref["id"])
             bot_pool.release_session(session_key)
 
     status_code = 206 if is_range else 200
@@ -698,7 +700,7 @@ async def deduplicate_run() -> dict[str, str]:
             telegram_manager.channel_entity,
         )
         _log("DEDUPE", f"Queued {result['queued']} deletions from {result['audited']} candidates")
-        telegram_manager.save_cache()
+        await telegram_manager.save_cache()
         search_engine.track_index = telegram_manager.track_index
         search_engine._initialized = False
 

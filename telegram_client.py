@@ -4,6 +4,7 @@ import gzip
 import io
 import os
 import re
+import time
 from typing import Any, Optional
 import orjson
 from telethon import TelegramClient, events, utils
@@ -17,6 +18,15 @@ from telethon.tl.types import (
 
 from cache import SimpleLRU
 from config import config
+
+
+def _json_default(obj: Any) -> Any:
+    """Convert unsupported types (sets, frozensets, bytes) into JSON-serializable representations."""
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    raise TypeError(f"Type is not JSON serializable: {type(obj).__name__}")
 
 AUDIO_EXTENSIONS = {"flac", "mp3", "m4a", "aac", "wav", "ogg", "opus", "alac", "ec3", "eac3"}
 EXT_TO_FORMAT = {
@@ -107,6 +117,9 @@ class TelegramManager:
         self._handler_registered = False
         self._cache_file_gz = os.path.join(os.path.dirname(__file__), "tracks_cache.json.gz")
         self._cache_file_tmp = self._cache_file_gz + ".tmp"
+        self._cache_lock = asyncio.Lock()
+        self._index_lock = asyncio.Lock()
+        self._incoming_during_indexing: list[dict[str, Any]] = []
 
     async def connect(self) -> None:
         """Connect and verify authentication of the primary user client."""
@@ -139,7 +152,9 @@ class TelegramManager:
                 from duplicates import check_new_track
                 res = await check_new_track(parsed, self.track_index, self.client, self.channel_entity)
                 if res:
-                    self.save_cache()
+                    if self.is_indexing:
+                        self._incoming_during_indexing.append(res)
+                    await self.save_cache()
                     _log("INDEX", f"New track added: {parsed['title']}")
 
         self._handler_registered = True
@@ -229,21 +244,42 @@ class TelegramManager:
                 data = f.read()
             raw_tracks = orjson.loads(data)
             if isinstance(raw_tracks, list):
+                for t in raw_tracks:
+                    if isinstance(t.get("_search_words"), list):
+                        t["_search_words"] = frozenset(t["_search_words"])
                 self.track_index = raw_tracks
                 return True
         except Exception as exc:
             print(f"[Cache] Failed to load {self._cache_file_gz}: {exc}")
         return False
 
-    def save_cache(self) -> None:
-        """Atomically persist track index to tracks_cache.json.gz."""
+    def _write_cache_file(self, snapshot: list[dict[str, Any]]) -> None:
+        """Synchronously serialize, compress, and atomically write cache file in worker thread."""
+        tmp_path = f"{self._cache_file_gz}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
-            compressed = gzip.compress(orjson.dumps(self.track_index))
-            with open(self._cache_file_tmp, "wb") as f:
+            json_bytes = orjson.dumps(snapshot, default=_json_default)
+            compressed = gzip.compress(json_bytes)
+            with open(tmp_path, "wb") as f:
                 f.write(compressed)
-            os.replace(self._cache_file_tmp, self._cache_file_gz)
+            os.replace(tmp_path, self._cache_file_gz)
         except Exception as exc:
             print(f"[Cache] Failed to save {self._cache_file_gz}: {exc}")
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def save_cache_sync(self) -> None:
+        """Synchronously persist track index to cache file."""
+        snapshot = list(self.track_index)
+        self._write_cache_file(snapshot)
+
+    async def save_cache(self) -> None:
+        """Atomically persist track index to tracks_cache.json.gz off the asyncio event loop."""
+        async with self._cache_lock:
+            snapshot = list(self.track_index)
+            await asyncio.to_thread(self._write_cache_file, snapshot)
 
     def _parse_track_message(self, msg: Any) -> Optional[dict[str, Any]]:
         """Extract audio metadata from a Telegram Message."""
@@ -333,53 +369,68 @@ class TelegramManager:
         }
 
     async def index_tracks(self) -> list[dict[str, Any]]:
-        """Scan channel messages in chronological order, extracting audio tracks and updating the cache."""
-        if self.is_indexing:
-            return self.track_index
+        """Scan channel messages in chronological order, extracting audio tracks and updating the cache safely."""
         if not self.client or not self.channel_entity:
             return self.track_index
 
-        self.is_indexing = True
-        try:
-            print("[Indexer] Starting channel audio indexing...")
-            new_index: list[dict[str, Any]] = []
-            seen_ids: set[str] = set()
-            existing_map = {str(t["id"]): t for t in self.track_index}
-            batch_count = 0
+        if self.is_indexing:
+            print("[Indexer] Indexing already in progress; awaiting active indexing task...")
+            async with self._index_lock:
+                return self.track_index
 
-            async for msg in self.client.iter_messages(self.channel_entity, reverse=True):
-                msg_id_str = str(msg.id)
-                if msg_id_str in seen_ids:
-                    continue
-                seen_ids.add(msg_id_str)
+        async with self._index_lock:
+            self.is_indexing = True
+            self._incoming_during_indexing = []
+            try:
+                print("[Indexer] Starting channel audio indexing...")
+                new_index: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+                existing_map = {str(t["id"]): t for t in self.track_index}
 
-                # Cache media in user media cache
-                if getattr(msg, "media", None):
-                    await self.media_cache.set(msg_id_str, msg.media)
+                async for msg in self.client.iter_messages(self.channel_entity, reverse=True):
+                    msg_id_str = str(msg.id)
+                    if msg_id_str in seen_ids:
+                        continue
+                    seen_ids.add(msg_id_str)
 
-                # Reuse existing parsed metadata when available
-                if msg_id_str in existing_map:
-                    new_index.append(existing_map[msg_id_str])
-                else:
-                    parsed = self._parse_track_message(msg)
-                    if parsed:
-                        new_index.append(parsed)
+                    # Cache media in user media cache
+                    if getattr(msg, "media", None):
+                        await self.media_cache.set(msg_id_str, msg.media)
 
-                batch_count += 1
-                if batch_count % 50 == 0:
-                    self.track_index = new_index
-                    self.save_cache()
+                    # Reuse existing parsed metadata when available
+                    if msg_id_str in existing_map:
+                        new_index.append(existing_map[msg_id_str])
+                    else:
+                        parsed = self._parse_track_message(msg)
+                        if parsed:
+                            new_index.append(parsed)
 
-            self.track_index = new_index
-            self.save_cache()
-            self.register_event_handler()
-            print(f"[Indexer] Indexing complete: {len(self.track_index)} tracks loaded.")
-            return self.track_index
-        except Exception as exc:
-            print(f"[Indexer] Error during track indexing: {exc}")
-            return self.track_index
-        finally:
-            self.is_indexing = False
+                # Merge any tracks received via on_new_message while indexing was running
+                for inc_track in self._incoming_during_indexing:
+                    inc_id = str(inc_track.get("id"))
+                    if inc_id not in seen_ids:
+                        seen_ids.add(inc_id)
+                        new_index.insert(0, inc_track)
+
+                # Merge any tracks that were in track_index but not in iteration (e.g. recent uploads)
+                for existing_t in self.track_index:
+                    t_id = str(existing_t.get("id"))
+                    if t_id not in seen_ids:
+                        seen_ids.add(t_id)
+                        new_index.insert(0, existing_t)
+
+                # Commit new_index and persist cache only after successful completion
+                self.track_index = new_index
+                await self.save_cache()
+                self.register_event_handler()
+                print(f"[Indexer] Indexing complete: {len(self.track_index)} tracks loaded.")
+                return self.track_index
+            except Exception as exc:
+                print(f"[Indexer] Temporary error during track indexing: {exc}. Retaining existing {len(self.track_index)} tracks.")
+                return self.track_index
+            finally:
+                self.is_indexing = False
+                self._incoming_during_indexing.clear()
 
     async def get_media(self, track_id: str | int, force: bool = False) -> Any:
         """Retrieve the msg.media document for a track, utilizing the LRU cache (500 entries)."""

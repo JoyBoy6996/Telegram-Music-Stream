@@ -179,16 +179,17 @@ def is_atmos_track(track: dict[str, Any]) -> bool:
 def is_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Determine whether track a and track b are genuine duplicates.
 
-    Safety principles enforced:
-    - Never delete across different IDs or when either is marked keep.
-    - Never delete across Atmos vs Stereo mixes.
-    - Never delete across different versions (Remix, Live, Acoustic, etc.).
-    - Exact token-based artist matching (NO substring matching).
-    - Unknown artists NEVER match unless verified by identical ISRC.
+    A file is a duplicate ONLY if all four match:
+    1. Filename (case-insensitive, ignoring extension).
+    2. File extension (case-insensitive).
+    3. File size (exact bytes).
+    4. Track duration (exact value).
+
+    If any condition differs or metadata is missing, return False (not duplicate).
     """
     id_a = str(a.get("id"))
     id_b = str(b.get("id"))
-    if id_a == id_b:
+    if not id_a or not id_b or id_a == id_b:
         return False
 
     # Persistent /keep check
@@ -196,68 +197,64 @@ def is_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:
     if a.get("keep") or id_a in kept_ids or b.get("keep") or id_b in kept_ids:
         return False
 
-    # Atmos vs Stereo protection
-    is_atmos_a = is_atmos_track(a)
-    is_atmos_b = is_atmos_track(b)
-    if is_atmos_a != is_atmos_b:
+    # 1. Filename (case-insensitive, ignoring extension) & 2. File extension (case-insensitive)
+    fn_a = a.get("fileName") or a.get("filename")
+    fn_b = b.get("fileName") or b.get("filename")
+    if not fn_a or not fn_b:
         return False
 
-    # Version protection: distinct musical arrangements must never be flagged as duplicates
-    tag_a = extract_version_tag(str(a.get("title") or ""))
-    tag_b = extract_version_tag(str(b.get("title") or ""))
-    if tag_a != tag_b:
+    name_a, ext_a = os.path.splitext(str(fn_a))
+    name_b, ext_b = os.path.splitext(str(fn_b))
+
+    ext_a = ext_a.lstrip(".").strip().lower()
+    ext_b = ext_b.lstrip(".").strip().lower()
+
+    if not ext_a:
+        ext_a = (a.get("format") or "").strip().lower()
+    if not ext_b:
+        ext_b = (b.get("format") or "").strip().lower()
+
+    name_a = name_a.strip().lower()
+    name_b = name_b.strip().lower()
+
+    if not name_a or not name_b or not ext_a or not ext_b:
         return False
 
-    # Exact ISRC match: identical master recording
-    isrc_a = str(a.get("isrc") or "").strip().upper()
-    isrc_b = str(b.get("isrc") or "").strip().upper()
-    if isrc_a and isrc_b and isrc_a == isrc_b:
-        return True
+    # Check 1: Filename ignoring extension
+    if name_a != name_b:
+        return False
 
-    # Duration check: reject if duration difference exceeds 15 seconds
+    # Check 2: File extension
+    if ext_a != ext_b:
+        return False
+
+    # Check 3: File size (exact bytes)
+    size_a = a.get("fileSize") if a.get("fileSize") is not None else a.get("sizeBytes")
+    size_b = b.get("fileSize") if b.get("fileSize") is not None else b.get("sizeBytes")
+    if size_a is None or size_b is None:
+        return False
+    try:
+        int_size_a = int(size_a)
+        int_size_b = int(size_b)
+        if int_size_a <= 0 or int_size_b <= 0 or int_size_a != int_size_b:
+            return False
+    except (ValueError, TypeError):
+        return False
+
+    # Check 4: Track duration (exact value)
     dur_a = a.get("duration")
     dur_b = b.get("duration")
-    if dur_a is not None and dur_b is not None:
-        try:
-            if abs(float(dur_a) - float(dur_b)) > 15:
-                return False
-        except (ValueError, TypeError):
-            pass
-
-    # Title check
-    title_a = normalize_title(str(a.get("title") or ""))
-    title_b = normalize_title(str(b.get("title") or ""))
-    core_a = get_core_title(str(a.get("title") or ""))
-    core_b = get_core_title(str(b.get("title") or ""))
-
-    if not title_a or not title_b:
+    if dur_a is None or dur_b is None:
+        return False
+    try:
+        f_dur_a = float(dur_a)
+        f_dur_b = float(dur_b)
+        if f_dur_a <= 0 or f_dur_b <= 0 or f_dur_a != f_dur_b:
+            return False
+    except (ValueError, TypeError):
         return False
 
-    titles_match = (
-        title_a == title_b
-        or core_a == core_b
-        or title_a == core_b
-        or core_a == title_b
-    )
-
-    if not titles_match:
-        return False
-
-    # Artist check: Token-based match (NO substring matching)
-    tokens_a = get_artist_tokens(str(a.get("artist") or ""))
-    tokens_b = get_artist_tokens(str(b.get("artist") or ""))
-
-    # Unknown artist safety: NEVER classify unknown artists as duplicates without independent ISRC
-    if not tokens_a or not tokens_b:
-        return False
-
-    # Both artists known: check exact token intersection
-    common_tokens = tokens_a & tokens_b
-    if common_tokens:
-        return True
-
-    # If artists differ, close duration alone is insufficient
-    return False
+    return True
 
 
 isDuplicate = is_duplicate
