@@ -1,5 +1,6 @@
 from itertools import combinations
 import re
+import threading
 from typing import Any, Optional
 
 TOKEN_SPLIT_REGEX = re.compile(r"[^\w]+", re.UNICODE)
@@ -41,53 +42,61 @@ class SearchEngine:
         self._initialized = False
         self._inverted: dict[str, set[str]] = {}
         self._tracks_by_id: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
 
     def _ensure_search_words(self) -> None:
-        """Lazily build _search_words, precomputed search fields, inverted index, and ID lookup on first search."""
+        """Lazily build _search_words, precomputed search fields, inverted index, and ID lookup safely and atomically."""
         if self._initialized:
             return
 
-        self._inverted = {}
-        self._tracks_by_id = {}
+        with self._lock:
+            if self._initialized:
+                return
 
-        for track in self.track_index:
-            track_id = str(track["id"])
-            self._tracks_by_id[track_id] = track
-            self._tracks_by_id[track["id"]] = track
+            tracks_snapshot = list(self.track_index)
+            new_inverted: dict[str, set[str]] = {}
+            new_tracks_by_id: dict[str, dict[str, Any]] = {}
 
-            title = track.get("title", "")
-            title_lower = (title or "").strip().lower()
-            title_core = extract_core_title(title_lower)
-            title_tokens = frozenset(tokenize(title_lower))
-            artist_tokens = frozenset(tokenize(track.get("artist")))
+            for track in tracks_snapshot:
+                track_id = str(track["id"])
+                new_tracks_by_id[track_id] = track
+                new_tracks_by_id[track["id"]] = track
 
-            track["_title_lower"] = title_lower
-            track["_title_core"] = title_core
-            track["_title_tokens"] = title_tokens
-            track["_artist_tokens"] = artist_tokens
+                title = track.get("title", "")
+                title_lower = (title or "").strip().lower()
+                title_core = extract_core_title(title_lower)
+                title_tokens = frozenset(tokenize(title_lower))
+                artist_tokens = frozenset(tokenize(track.get("artist")))
 
-            if "_search_words" not in track:
-                album = track.get("album", "")
-                isrc = track.get("isrc", "")
+                track["_title_lower"] = title_lower
+                track["_title_core"] = title_core
+                track["_title_tokens"] = title_tokens
+                track["_artist_tokens"] = artist_tokens
 
-                words: set[str] = set()
-                words.update(title_tokens)
-                words.update(tokenize(title_core))
-                words.update(artist_tokens)
-                words.update(tokenize(album))
-                if isrc:
-                    words.add(str(isrc).lower().strip())
+                if "_search_words" not in track:
+                    album = track.get("album", "")
+                    isrc = track.get("isrc", "")
 
-                track["_search_words"] = frozenset(words)
-            elif isinstance(track["_search_words"], (list, set)):
-                track["_search_words"] = frozenset(track["_search_words"])
+                    words: set[str] = set()
+                    words.update(title_tokens)
+                    words.update(tokenize(title_core))
+                    words.update(artist_tokens)
+                    words.update(tokenize(album))
+                    if isrc:
+                        words.add(str(isrc).lower().strip())
 
-            for token in track["_search_words"]:
-                if token not in self._inverted:
-                    self._inverted[token] = set()
-                self._inverted[token].add(track_id)
+                    track["_search_words"] = frozenset(words)
+                elif isinstance(track["_search_words"], (list, set)):
+                    track["_search_words"] = frozenset(track["_search_words"])
 
-        self._initialized = True
+                for token in track["_search_words"]:
+                    if token not in new_inverted:
+                        new_inverted[token] = set()
+                    new_inverted[token].add(track_id)
+
+            self._inverted = new_inverted
+            self._tracks_by_id = new_tracks_by_id
+            self._initialized = True
 
     def search(
         self,

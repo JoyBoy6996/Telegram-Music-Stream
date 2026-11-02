@@ -160,48 +160,50 @@ _tunnel_tasks: list[asyncio.Task] = []
 
 async def prewarm_track(track_id: str, session_key: str = "127.0.0.1") -> None:
     """Pre-warm fastStartCache (512KB) and tagSliceCache (256KB) in background using user session's bot."""
-    if await fast_start_cache.has(track_id):
-        return
-
-    async with _prewarm_semaphore:
-        lease = await bot_pool.acquire_for_session(session_key)
-        if not lease:
+    try:
+        if await fast_start_cache.has(track_id):
             return
 
-        _log("BOTPOOL", f"{lease.bot['id']} -> prewarm {track_id}")
-        dl_client = lease.bot["client"]
-        bot_ref = lease.bot
-
-        try:
-            media = await bot_pool.get_media(lease.bot, track_id)
-            if not media or not dl_client:
+        async with _prewarm_semaphore:
+            lease = await bot_pool.acquire_for_session(session_key)
+            if not lease:
                 return
 
-            chunks: list[bytes] = []
-            bytes_collected = 0
+            _log("BOTPOOL", f"{lease.bot['id']} -> prewarm {track_id}")
+            dl_client = lease.bot["client"]
+            bot_ref = lease.bot
 
-            async for chunk in dl_client.iter_download(
-                file=media,
-                offset=0,
-                request_size=REQUEST_CHUNK_SIZE,
-            ):
-                chunks.append(chunk)
-                bytes_collected += len(chunk)
-                if bytes_collected >= FAST_START_BYTES:
-                    break
+            try:
+                media = await bot_pool.get_media(lease.bot, track_id)
+                if not media or not dl_client:
+                    return
 
-            if chunks:
-                full_preamble = b"".join(chunks)
-                chunks.clear()  # Free chunk buffers immediately from RAM
-                await fast_start_cache.set(track_id, full_preamble)
-                tag_slice = full_preamble[:TAG_SLICE_BYTES]
-                await tag_slice_cache.set(track_id, tag_slice)
-        except Exception as exc:
-            if bot_ref:
-                bot_pool.report_error(bot_ref, exc)
-        finally:
-            bot_pool.release_session(session_key)
-            _prewarming_ids.discard(track_id)
+                chunks: list[bytes] = []
+                bytes_collected = 0
+
+                async for chunk in dl_client.iter_download(
+                    file=media,
+                    offset=0,
+                    request_size=REQUEST_CHUNK_SIZE,
+                ):
+                    chunks.append(chunk)
+                    bytes_collected += len(chunk)
+                    if bytes_collected >= FAST_START_BYTES:
+                        break
+
+                if chunks:
+                    full_preamble = b"".join(chunks)
+                    chunks.clear()  # Free chunk buffers immediately from RAM
+                    await fast_start_cache.set(track_id, full_preamble)
+                    tag_slice = full_preamble[:TAG_SLICE_BYTES]
+                    await tag_slice_cache.set(track_id, tag_slice)
+            except Exception as exc:
+                if bot_ref:
+                    bot_pool.report_error(bot_ref, exc)
+            finally:
+                bot_pool.release_session(session_key)
+    finally:
+        _prewarming_ids.discard(track_id)
 
 
 async def start_cloudflare_tunnel(port: int) -> None:
@@ -246,6 +248,8 @@ async def stop_cloudflare_tunnel() -> None:
     for t in _tunnel_tasks:
         if not t.done():
             t.cancel()
+    if _tunnel_tasks:
+        await asyncio.gather(*_tunnel_tasks, return_exceptions=True)
     _tunnel_tasks.clear()
 
     if tunnel_process:
@@ -293,10 +297,10 @@ async def background_indexer() -> None:
         await telegram_manager.save_cache()
         await asyncio.sleep(0)
 
-        # Refresh and precompute search structures in background to avoid user search stalls
+        # Refresh and precompute search structures off the event loop to avoid user search stalls
         search_engine.track_index = telegram_manager.track_index
         search_engine._initialized = False
-        search_engine._ensure_search_words()
+        await asyncio.to_thread(search_engine._ensure_search_words)
 
         # Reclaim temporary objects created during indexing on 1 GB VPS
         import gc
@@ -322,14 +326,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if telegram_manager.load_cache():
         print(f"[Cache] Loaded {len(telegram_manager.track_index)} tracks from cache.")
         search_engine.track_index = telegram_manager.track_index
+        await asyncio.to_thread(search_engine._ensure_search_words)
 
     # 4. Init botpool if bot tokens configured
     if config.bot_tokens:
         await bot_pool.init(telegram_manager.channel_entity)
 
     # 5. Start Cloudflare tunnel if enabled
+    _tunnel_runner_task: Optional[asyncio.Task] = None
     if config.ENABLE_CLOUDFLARE_TUNNEL:
-        asyncio.create_task(start_cloudflare_tunnel(config.PORT))
+        _tunnel_runner_task = asyncio.create_task(start_cloudflare_tunnel(config.PORT))
 
     # 6. Start background index_tracks() task idempotently
     await trigger_background_indexer()
@@ -337,11 +343,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # Teardown
-    global _background_indexer_task
+    global _background_indexer_task, _dedupe_task
     if _background_indexer_task and not _background_indexer_task.done():
         _background_indexer_task.cancel()
         try:
             await _background_indexer_task
+        except asyncio.CancelledError:
+            pass
+
+    if _dedupe_task and not _dedupe_task.done():
+        _dedupe_task.cancel()
+        try:
+            await _dedupe_task
+        except asyncio.CancelledError:
+            pass
+
+    if _tunnel_runner_task and not _tunnel_runner_task.done():
+        _tunnel_runner_task.cancel()
+        try:
+            await _tunnel_runner_task
         except asyncio.CancelledError:
             pass
 
@@ -441,8 +461,14 @@ async def search_tracks(
     t0 = time.time()
     base = get_base_url(request)
     session_key = get_session_key(request)
-    atmos_preferred = atmos in {"auto", "true"}
-    matches = search_engine.search(query=q, atmos_preferred=atmos_preferred, duration=duration)
+    if not search_engine._initialized:
+        await asyncio.to_thread(search_engine._ensure_search_words)
+    matches = await asyncio.to_thread(
+        search_engine.search,
+        query=q,
+        atmos_preferred=atmos_preferred,
+        duration=duration,
+    )
     ms = round((time.time() - t0) * 1000)
     _log("SEARCH", f'"{q}" ({len(matches)} hits, {ms}ms) -> ID: {matches[0]["id"] if matches else "none"}')
     if matches:
@@ -859,7 +885,7 @@ async def deduplicate_run() -> dict[str, str]:
                 await telegram_manager.save_cache()
                 search_engine.track_index = telegram_manager.track_index
                 search_engine._initialized = False
-                search_engine._ensure_search_words()
+                await asyncio.to_thread(search_engine._ensure_search_words)
                 import gc
                 gc.collect()
             except asyncio.CancelledError:
