@@ -153,7 +153,7 @@ class BotPool:
                 "client": client,
                 "channel": channel,
                 "cooldown_until": 0.0,
-                "media_cache": SimpleLRU(500),
+                "media_cache": SimpleLRU(100),
                 "active": True,
                 "active_streams": 0,
                 "active_stream_ids": set(),

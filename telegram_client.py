@@ -113,7 +113,7 @@ class TelegramManager:
     def __init__(self) -> None:
         self.client: Optional[TelegramClient] = None
         self.channel_entity: Any = None
-        self.media_cache = SimpleLRU(500)
+        self.media_cache = SimpleLRU(200)
         self.track_index: list[dict[str, Any]] = []
         self.is_indexing = False
         self._handler_registered = False
