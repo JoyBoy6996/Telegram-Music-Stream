@@ -462,6 +462,7 @@ async def search_tracks(
     t0 = time.time()
     base = get_base_url(request)
     session_key = get_session_key(request)
+    atmos_preferred = atmos in {"auto", "true"}
     if not search_engine._initialized:
         await asyncio.to_thread(search_engine._ensure_search_words)
     matches = await asyncio.to_thread(
