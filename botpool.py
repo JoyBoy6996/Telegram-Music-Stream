@@ -21,7 +21,10 @@ class BotLease:
         if not self._released:
             self._released = True
             if self._release_fn:
-                self._release_fn()
+                try:
+                    self._release_fn()
+                except Exception:
+                    pass
 
     def __await__(self):
         async def _identity():
@@ -41,12 +44,16 @@ class BotPool:
     def __init__(self, api_id: int, api_hash: str, tokens: list[str]) -> None:
         self.api_id = api_id
         self.api_hash = api_hash
-        # Support a maximum of 20 configured bots
-        self.tokens = [
-            t.strip().strip('"').strip("'")
-            for t in tokens
-            if t.strip().strip('"').strip("'")
-        ][:self.MAX_BOTS]
+        # Support a maximum of 20 configured unique bots
+        seen_tokens: set[str] = set()
+        cleaned_tokens: list[str] = []
+        for t in tokens:
+            cleaned = t.strip().strip('"').strip("'")
+            if cleaned and cleaned not in seen_tokens:
+                seen_tokens.add(cleaned)
+                cleaned_tokens.append(cleaned)
+        self.tokens = cleaned_tokens[:self.MAX_BOTS]
+
         self._channel_ref: Any = None
         self._rr_index = 0
         self.bots: list[dict[str, Any]] = []
@@ -117,7 +124,7 @@ class BotPool:
 
         return None
 
-    async def _connect_bot(self, bot_id: str, token: str) -> Optional[dict[str, Any]]:
+    async def _connect_bot(self, bot_id: str, token: str, token_idx: int) -> Optional[dict[str, Any]]:
         """Connect a single bot client and resolve the target channel without crashing."""
         try:
             client = TelegramClient(
@@ -142,29 +149,36 @@ class BotPool:
             return {
                 "id": bot_id,
                 "token": token,
+                "token_idx": token_idx,
                 "client": client,
                 "channel": channel,
                 "cooldown_until": 0.0,
                 "media_cache": SimpleLRU(500),
                 "active": True,
                 "active_streams": 0,
+                "active_stream_ids": set(),
             }
         except Exception as exc:
             print(f"[BotPool] Warning: Failed to initialize {bot_id}: {exc}")
             return None
 
     def _cleanup_expired_sessions(self, timeout_seconds: float = 30.0) -> None:
-        """Auto-release any sessions with no request for timeout_seconds."""
+        """Auto-release any sessions with no request for timeout_seconds,
+
+        unless the assigned bot is currently serving an active stream.
+        """
         now = time.time()
-        expired = [
-            sk for sk, last_active in self._session_activity.items()
-            if now - last_active > timeout_seconds
-        ]
-        for sk in expired:
-            bot_id = self._sessions.pop(sk, None)
-            self._session_activity.pop(sk, None)
-            if bot_id:
-                print(f"[BotPool] Session {sk} timed out ({timeout_seconds}s), released {bot_id}")
+        for sk, last_active in list(self._session_activity.items()):
+            if now - last_active > timeout_seconds:
+                bot_id = self._sessions.get(sk)
+                # Prevent reaper from expiring bots with active streams
+                if bot_id and self.is_stream_active(bot_id):
+                    self._session_activity[sk] = now  # Keep alive while streaming
+                    continue
+                self._sessions.pop(sk, None)
+                self._session_activity.pop(sk, None)
+                if bot_id:
+                    print(f"[BotPool] Session {sk} timed out ({timeout_seconds}s), released {bot_id}")
 
     async def _reaper_loop(self) -> None:
         """Background loop to auto-release idle sessions every 5 seconds."""
@@ -184,16 +198,17 @@ class BotPool:
 
         # Disconnect any previously active bots that do not have active streams
         for b in self.bots:
-            if b.get("active_streams", 0) > 0:
+            if self.is_stream_active(b["id"]):
                 print(f"[BotPool] Bot {b['id']} has active stream; deferring disconnect.")
                 continue
             try:
-                if b.get("client") and b["client"].is_connected():
-                    await b["client"].disconnect()
+                client = b.get("client")
+                if client and client.is_connected():
+                    await client.disconnect()
             except Exception:
                 pass
 
-        self.bots = [b for b in self.bots if b.get("active_streams", 0) > 0]
+        self.bots = [b for b in self.bots if self.is_stream_active(b["id"])]
         self._rr_index = 0
         self._sessions.clear()
         self._session_activity.clear()
@@ -204,14 +219,14 @@ class BotPool:
         if not self.tokens or not self.api_id or not self.api_hash:
             return
 
-        # Connect up to 10 bots during application startup
+        # Connect up to 10 bots during application startup with unique 1:1 token allocation
         startup_count = min(self.STARTUP_BOTS, len(self.tokens))
         print(f"[BotPool] Connecting {startup_count} bot(s) at startup (configured: {len(self.tokens)}, max: {self.MAX_BOTS})...")
 
         for i in range(startup_count):
             bot_id = f"bot{i + 1}"
             token = self.tokens[i]
-            bot = await self._connect_bot(bot_id, token)
+            bot = await self._connect_bot(bot_id, token, i)
             if bot:
                 self.bots.append(bot)
 
@@ -220,17 +235,29 @@ class BotPool:
         self._reaper_task = asyncio.create_task(self._reaper_loop())
 
     async def _activate_next_bot(self) -> Optional[dict[str, Any]]:
-        """Dynamically activate another configured bot when all active bots are busy."""
-        # Never activate more than 20 bots
+        """Dynamically activate another configured bot when all active bots are busy.
+
+        Guarantees unique bot IDs and strict 1:1 token allocation.
+        """
         if len(self.bots) >= self.MAX_BOTS or len(self.bots) >= len(self.tokens):
             return None
 
-        next_idx = len(self.bots)
+        # Find the lowest token index not currently allocated to any connected bot
+        allocated_indices = {b.get("token_idx") for b in self.bots if "token_idx" in b}
+        next_idx = None
+        for i in range(len(self.tokens)):
+            if i not in allocated_indices:
+                next_idx = i
+                break
+
+        if next_idx is None:
+            return None
+
         bot_id = f"bot{next_idx + 1}"
         token = self.tokens[next_idx]
 
         print(f"[BotPool] All active bots busy. Dynamically activating {bot_id}...")
-        bot = await self._connect_bot(bot_id, token)
+        bot = await self._connect_bot(bot_id, token, next_idx)
         if bot:
             self.bots.append(bot)
             print(f"[BotPool] Successfully activated {bot_id} dynamically (total active: {len(self.bots)}/{len(self.tokens)}).")
@@ -238,7 +265,10 @@ class BotPool:
         return None
 
     def _find_idle_bot(self, active_bot_ids: set[str], now: float) -> Optional[dict[str, Any]]:
-        """Find the next idle, healthy bot (round-robin) among currently connected bots."""
+        """Find the next idle, healthy bot (round-robin) among currently connected bots.
+
+        Never selects bots on cooldown, assigned to sessions, or actively streaming.
+        """
         num_bots = len(self.bots)
         if num_bots == 0:
             return None
@@ -249,6 +279,8 @@ class BotPool:
             if candidate["id"] in active_bot_ids:
                 continue
             if candidate.get("cooldown_until", 0.0) > now:
+                continue
+            if self.is_stream_active(candidate["id"]):
                 continue
             self._rr_index = (idx + 1) % num_bots
             return candidate
@@ -268,7 +300,7 @@ class BotPool:
                     self._session_activity[session_key] = now
                     return BotLease(bot)
                 else:
-                    # Bot was removed or is on FloodWait cooldown: release session to switch to healthy bot
+                    # Bot was removed or is on FloodWait cooldown: release session mapping safely
                     if bot:
                         print(f"[BotPool] Assigned bot {assigned_bot_id} for session {session_key} is on cooldown; reassigning")
                     self._sessions.pop(session_key, None)
@@ -302,6 +334,13 @@ class BotPool:
                     self._sessions[session_key] = candidate["id"]
                     self._session_activity[session_key] = now
                     return BotLease(candidate)
+                # Try activating if capacity opened
+                if len(self.bots) < min(self.MAX_BOTS, len(self.tokens)):
+                    new_bot = await self._activate_next_bot()
+                    if new_bot and new_bot.get("cooldown_until", 0.0) <= now:
+                        self._sessions[session_key] = new_bot["id"]
+                        self._session_activity[session_key] = now
+                        return BotLease(new_bot)
 
         # Still no bot available: log and return None safely without crashing
         print(f"[BotPool] All bots busy, user {session_key} waiting")
@@ -315,7 +354,10 @@ class BotPool:
             print(f"[BotPool] Released session {session_key} (bot: {bot_id})")
 
     async def acquire(self) -> Optional[BotLease]:
-        """Round-robin acquisition across available bots not on cooldown, with dynamic activation."""
+        """Round-robin acquisition across available bots not on cooldown, with dynamic activation.
+
+        Guarantees that artwork and background requests NEVER use stream-reserved bots.
+        """
         async with self._lock:
             now = time.time()
             if not self.bots and len(self.tokens) > 0:
@@ -324,42 +366,56 @@ class BotPool:
                 return None
 
             active_bot_ids = set(self._sessions.values())
+            # 1. Look for an idle, unreserved bot (not in sessions, not streaming, not on cooldown)
             candidate = self._find_idle_bot(active_bot_ids, now)
             if candidate:
                 return BotLease(candidate)
 
-            # If all are in sessions, try activating another bot if under limit
+            # 2. If all active bots are reserved/busy, activate another bot if under limit
             if len(self.bots) < min(self.MAX_BOTS, len(self.tokens)):
                 new_bot = await self._activate_next_bot()
-                if new_bot and new_bot.get("cooldown_until", 0.0) <= now:
+                if (
+                    new_bot
+                    and new_bot.get("cooldown_until", 0.0) <= now
+                    and not self.is_stream_active(new_bot["id"])
+                ):
                     return BotLease(new_bot)
 
-            # Fallback: choose the healthy bot with fewest active streams
-            healthy = [b for b in self.bots if b.get("cooldown_until", 0.0) <= now]
-            if healthy:
-                healthy.sort(key=lambda b: b.get("active_streams", 0))
-                return BotLease(healthy[0])
-
+            # 3. Do NOT borrow stream-reserved or actively streaming bots.
             return None
 
-    def mark_stream_start(self, bot_id: str) -> None:
-        """Increment active stream counter for a bot to protect it from disconnection."""
+    def mark_stream_start(self, bot_id: str, stream_id: Optional[str] = None) -> str:
+        """Register active stream for a bot idempotently to protect it from disconnection."""
+        sid = stream_id or f"stream_{time.time_ns()}"
         for b in self.bots:
             if b["id"] == bot_id:
-                b["active_streams"] = b.get("active_streams", 0) + 1
+                if "active_stream_ids" not in b or not isinstance(b["active_stream_ids"], set):
+                    b["active_stream_ids"] = set()
+                b["active_stream_ids"].add(sid)
+                b["active_streams"] = len(b["active_stream_ids"])
                 break
+        return sid
 
-    def mark_stream_end(self, bot_id: str) -> None:
-        """Decrement active stream counter for a bot."""
+    def mark_stream_end(self, bot_id: str, stream_id: Optional[str] = None) -> None:
+        """Unregister active stream for a bot idempotently."""
         for b in self.bots:
             if b["id"] == bot_id:
-                b["active_streams"] = max(0, b.get("active_streams", 0) - 1)
+                if "active_stream_ids" in b and isinstance(b["active_stream_ids"], set):
+                    if stream_id:
+                        b["active_stream_ids"].discard(stream_id)
+                    elif b["active_stream_ids"]:
+                        b["active_stream_ids"].pop()
+                    b["active_streams"] = len(b["active_stream_ids"])
+                else:
+                    b["active_streams"] = max(0, b.get("active_streams", 0) - 1)
                 break
 
     def is_stream_active(self, bot_id: str) -> bool:
         """Check if bot is actively serving a stream."""
         for b in self.bots:
             if b["id"] == bot_id:
+                if "active_stream_ids" in b and isinstance(b["active_stream_ids"], set):
+                    return len(b["active_stream_ids"]) > 0
                 return b.get("active_streams", 0) > 0
         return False
 
@@ -387,8 +443,12 @@ class BotPool:
         return None
 
     def report_error(self, bot: dict[str, Any], err: Any) -> None:
-        """Parse FLOOD_WAIT from error, place bot in cooldown, and release affected sessions."""
+        """Parse FLOOD_WAIT from error, place bot in cooldown safely, and release affected sessions."""
         if not bot or not err:
+            return
+
+        bot_id = bot.get("id") if isinstance(bot, dict) else getattr(bot, "id", None)
+        if not bot_id:
             return
 
         seconds = 0
@@ -403,30 +463,42 @@ class BotPool:
                 seconds = int(match.group(1))
 
         if seconds > 0:
-            bot["cooldown_until"] = time.time() + seconds
-            print(f"[BotPool] {bot['id']} flood-wait {seconds}s, placed on cooldown until {bot['cooldown_until']}")
-            # Release any session using this bot so user can be reassigned to a healthy bot
-            to_remove = [sk for sk, bid in self._sessions.items() if bid == bot["id"]]
+            target_cooldown = time.time() + seconds
+            if isinstance(bot, dict):
+                bot["cooldown_until"] = max(bot.get("cooldown_until", 0.0), target_cooldown)
+            for b in self.bots:
+                if b["id"] == bot_id:
+                    b["cooldown_until"] = max(b.get("cooldown_until", 0.0), target_cooldown)
+                    break
+
+            print(f"[BotPool] {bot_id} flood-wait {seconds}s, placed on cooldown")
+            # Release any session using this bot safely
+            to_remove = [sk for sk, bid in list(self._sessions.items()) if bid == bot_id]
             for sk in to_remove:
                 self.release_session(sk)
 
     async def close(self) -> None:
-        """Disconnect idle bot clients while strictly protecting bots with active streams."""
-        if self._reaper_task and not self._reaper_task.done():
-            self._reaper_task.cancel()
-        self._sessions.clear()
-        self._session_activity.clear()
+        """Disconnect idle bot clients while strictly protecting bots with active streams.
 
-        remaining_bots: list[dict[str, Any]] = []
-        for b in self.bots:
-            # Never disconnect a bot that is currently serving an active stream
-            if b.get("active_streams", 0) > 0:
-                print(f"[BotPool] Bot {b['id']} has {b['active_streams']} active stream(s); preserving connection.")
-                remaining_bots.append(b)
-                continue
-            try:
-                if b.get("client") and b["client"].is_connected():
-                    await b["client"].disconnect()
-            except Exception:
-                pass
-        self.bots = remaining_bots
+        Race-safe and idempotent.
+        """
+        async with self._lock:
+            if self._reaper_task and not self._reaper_task.done():
+                self._reaper_task.cancel()
+            self._sessions.clear()
+            self._session_activity.clear()
+
+            remaining_bots: list[dict[str, Any]] = []
+            for b in self.bots:
+                # Never disconnect a bot that is currently serving an active stream
+                if self.is_stream_active(b["id"]):
+                    print(f"[BotPool] Bot {b['id']} has active stream(s); preserving connection.")
+                    remaining_bots.append(b)
+                    continue
+                try:
+                    client = b.get("client")
+                    if client and client.is_connected():
+                        await client.disconnect()
+                except Exception:
+                    pass
+            self.bots = remaining_bots

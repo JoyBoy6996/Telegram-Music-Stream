@@ -7,6 +7,7 @@ tracks_cache.json
 tracks_cache.json.gz
 tracks_cache.json.gz.tmp
 tracks_cache.json.gz.bak
+exit
 
 # Zip & Archive files
 *.zip

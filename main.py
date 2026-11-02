@@ -577,8 +577,8 @@ async def stream_audio(
     # 5. Async streaming generator
     async def audio_generator() -> AsyncGenerator[bytes, None]:
         nonlocal dl_client, media, bot_ref, session_key
-        bytes_sent = 0
-        bot_pool.mark_stream_start(bot_ref["id"])
+        stream_id = f"{session_key}:{track_id}:{time.time_ns()}"
+        bot_pool.mark_stream_start(bot_ref["id"], stream_id)
 
         try:
             # Check fastStartCache for requested byte range
@@ -663,7 +663,7 @@ async def stream_audio(
 
                     raise exc
         finally:
-            bot_pool.mark_stream_end(bot_ref["id"])
+            bot_pool.mark_stream_end(bot_ref["id"], stream_id)
             bot_pool.release_session(session_key)
 
     status_code = 206 if is_range else 200
