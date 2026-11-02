@@ -60,6 +60,7 @@ def get_session_key(request: Request) -> str:
 FAST_START_BYTES = 512 * 1024       # 512 KB
 TAG_SLICE_BYTES = 256 * 1024        # 256 KB
 REQUEST_CHUNK_SIZE = 256 * 1024     # 256 KB
+RANGE_REGEX = re.compile(r"^bytes=(\d*)-(\d*)")
 
 fast_start_cache = SimpleLRU(50)    # 50 x 512KB = ~25MB max
 tag_slice_cache = SimpleLRU(200)    # 200 x 256KB = 50MB max
@@ -405,7 +406,7 @@ async def get_isrc(request: Request, code: str) -> dict[str, Any]:
 @router.get("/stream/{track_id}")
 async def get_stream_info(track_id: str, request: Request) -> dict[str, Any]:
     base = get_base_url(request)
-    track = next((t for t in telegram_manager.track_index if str(t["id"]) == track_id), None)
+    track = telegram_manager.get_track(track_id)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
@@ -489,11 +490,52 @@ async def stream_audio(
     """Stream audio document with HTTP 206 Range support, fast start caching, and session-based bot leasing."""
     session_key = get_session_key(request)
 
-    # 1. Check metadata and total size
-    track = next((t for t in telegram_manager.track_index if str(t["id"]) == track_id), None)
+    # 1. O(1) track lookup
+    track = telegram_manager.get_track(track_id)
     total_size = int(track.get("fileSize", 0)) if track else 0
 
-    # 2. Acquire bot lease for user session
+    # 2. Parse Range header with pre-compiled regex
+    start = 0
+    end = total_size - 1
+    is_range = False
+
+    if range:
+        match = RANGE_REGEX.match(range)
+        if match:
+            s_str, e_str = match.groups()
+            if s_str == "" and e_str != "":
+                suffix = int(e_str)
+                start = max(0, total_size - suffix)
+                end = total_size - 1
+                is_range = True
+            elif s_str != "":
+                start = int(s_str)
+                end = int(e_str) if e_str != "" else (total_size - 1 if total_size else 0)
+                is_range = True
+
+    # 3. Early return: serve directly from fast_start_cache if range is fully within cached preamble
+    #    (e.g. bytes=0-1 metadata probes or tiny preamble seeks) — zero Telegram calls, zero bot lease
+    if total_size and is_range:
+        cached_preamble = await fast_start_cache.get(track_id)
+        if cached_preamble and end < len(cached_preamble):
+            slice_data = cached_preamble[start:end + 1]
+            content_type = (
+                "audio/mp4" if (track and track.get("isAtmos"))
+                else (track.get("mimeType") or "audio/mpeg")
+            )
+            return Response(
+                content=slice_data,
+                status_code=206,
+                headers={
+                    "Content-Type": content_type,
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(slice_data)),
+                    "Content-Range": f"bytes {start}-{end}/{total_size}",
+                    "Cache-Control": "public, max-age=86400",
+                },
+            )
+
+    # 4. Acquire bot lease for Telegram download
     lease: Optional[BotLease] = await bot_pool.acquire_for_session(session_key)
     if not lease:
         raise HTTPException(
@@ -504,40 +546,22 @@ async def stream_audio(
     dl_client = lease.bot["client"]
     bot_ref = lease.bot
 
-    # 3. Resolve media via dedicated bot
-    media = await bot_pool.get_media(lease.bot, track_id)
-    if not media:
-        bot_pool.release_session(session_key)
-        raise HTTPException(status_code=404, detail="Media not found")
+    # 5. If total_size unknown, fetch media now to get doc.size; otherwise defer to generator
+    media_resolved: Any = None
+    if not total_size:
+        media_resolved = await bot_pool.get_media(lease.bot, track_id)
+        if not media_resolved:
+            bot_pool.release_session(session_key)
+            raise HTTPException(status_code=404, detail="Media not found")
+        doc = getattr(media_resolved, "document", None)
+        total_size = int(getattr(doc, "size", 0) or 0)
+        if not total_size:
+            bot_pool.release_session(session_key)
+            raise HTTPException(status_code=500, detail="Unable to determine audio file size")
+        # Recalculate end now that total_size is known
+        end = int(e_str) if (is_range and e_str != "") else total_size - 1
 
     _log("BOTPOOL", f"{lease.bot['id']} -> track {track_id}")
-
-    doc = getattr(media, "document", None)
-    if not total_size and doc:
-        total_size = int(getattr(doc, "size", 0) or 0)
-
-    if not total_size:
-        bot_pool.release_session(session_key)
-        raise HTTPException(status_code=500, detail="Unable to determine audio file size")
-
-    # 4. Parse Range header -> start, end bytes
-    start = 0
-    end = total_size - 1
-    is_range = False
-
-    if range:
-        match = re.match(r"bytes=(\d*)-(\d*)", range)
-        if match:
-            s_str, e_str = match.groups()
-            if s_str == "" and e_str != "":
-                suffix = int(e_str)
-                start = max(0, total_size - suffix)
-                end = total_size - 1
-                is_range = True
-            elif s_str != "":
-                start = int(s_str)
-                end = int(e_str) if e_str != "" else total_size - 1
-                is_range = True
 
     if is_range and (start >= total_size or start > end):
         bot_pool.release_session(session_key)
@@ -553,7 +577,7 @@ async def stream_audio(
     content_type = (
         "audio/mp4"
         if (track and track.get("isAtmos"))
-        else (getattr(doc, "mime_type", None) or "audio/mpeg")
+        else (track.get("mimeType") if track else None) or "audio/mpeg"
     )
 
     headers = {
@@ -566,21 +590,23 @@ async def stream_audio(
         headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
 
     if start == 0 and not await fast_start_cache.has(track_id):
-        _log("PROBE", f'{track["title"]} (64 KB header read)')
+        _log("PROBE", f'{track["title"] if track else track_id} (64 KB header read)')
 
-    if is_range and start > 0:
+    if is_range and start > 0 and track:
         pct = round(start / total_size * 100) if total_size else 0
         _log("SEEK", f'{track["title"]} • Seeked to ~{_fmt_duration(start // (total_size // max(track.get("duration",1),1))*1 if total_size else 0)} ({pct}%) • {_fmt_size(start)}')
-    elif not is_range:
+    elif not is_range and track:
         _log("PRECACHE", f'{track["title"]} • {_fmt_quality(track)} • {_fmt_size(total_size)} ({_fmt_duration(track.get("duration"))}) -> 200 OK')
 
-    # 5. Async streaming generator
+    # 6. Async streaming generator — media fetched lazily here to minimize TTFB
     async def audio_generator() -> AsyncGenerator[bytes, None]:
-        nonlocal dl_client, media, bot_ref, session_key
+        nonlocal dl_client, bot_ref, session_key
         stream_id = f"{session_key}:{track_id}:{time.time_ns()}"
         bot_pool.mark_stream_start(bot_ref["id"], stream_id)
 
         try:
+            bytes_sent = 0
+
             # Check fastStartCache for requested byte range
             cached_preamble = await fast_start_cache.get(track_id)
             if cached_preamble and start < len(cached_preamble):
@@ -592,6 +618,11 @@ async def stream_audio(
 
                 if bytes_sent >= bytes_needed:
                     return
+
+            # Lazy media fetch — happens after headers are sent, reducing TTFB
+            media = media_resolved or await bot_pool.get_media(bot_ref, track_id)
+            if not media:
+                return
 
             # Alignment logic: offset must align with REQUEST_CHUNK_SIZE
             current_pos = start + bytes_sent

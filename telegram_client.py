@@ -87,10 +87,12 @@ def is_audio_document(doc: Document) -> bool:
         return False
     mime = (doc.mime_type or "").lower()
     file_name = ""
+    has_audio_attr = False
     for attr in getattr(doc, "attributes", []) or []:
         if isinstance(attr, DocumentAttributeFilename):
             file_name = attr.file_name or ""
-            break
+        elif isinstance(attr, DocumentAttributeAudio):
+            has_audio_attr = True
 
     ext = file_name.split(".")[-1].lower() if "." in file_name else ""
 
@@ -100,9 +102,8 @@ def is_audio_document(doc: Document) -> bool:
 
     is_audio_mime = mime.startswith("audio/") or mime in {"application/ogg", "application/x-flac"}
     is_audio_ext = ext in AUDIO_EXTENSIONS
-    is_audio_attr = any(isinstance(a, DocumentAttributeAudio) for a in (getattr(doc, "attributes", []) or []))
 
-    return bool(is_audio_mime or is_audio_ext or is_audio_attr)
+    return bool(is_audio_mime or is_audio_ext or has_audio_attr)
 
 
 class TelegramManager:
@@ -120,6 +121,18 @@ class TelegramManager:
         self._cache_lock = asyncio.Lock()
         self._index_lock = asyncio.Lock()
         self._incoming_during_indexing: list[dict[str, Any]] = []
+        self._track_map: dict[str, dict[str, Any]] = {}
+
+    def get_track(self, track_id: str | int) -> Optional[dict[str, Any]]:
+        """Fast O(1) track lookup by ID with fallback."""
+        tid = str(track_id)
+        track = self._track_map.get(tid)
+        if track is not None:
+            return track
+        track = next((t for t in self.track_index if str(t.get("id")) == tid), None)
+        if track:
+            self._track_map[tid] = track
+        return track
 
     async def connect(self) -> None:
         """Connect and verify authentication of the primary user client."""
@@ -154,6 +167,7 @@ class TelegramManager:
                 if res:
                     if self.is_indexing:
                         self._incoming_during_indexing.append(res)
+                    self._track_map[str(res["id"])] = res
                     await self.save_cache()
                     _log("INDEX", f"New track added: {parsed['title']}")
 
@@ -248,6 +262,7 @@ class TelegramManager:
                     if isinstance(t.get("_search_words"), list):
                         t["_search_words"] = frozenset(t["_search_words"])
                 self.track_index = raw_tracks
+                self._track_map = {str(t["id"]): t for t in self.track_index}
                 return True
         except Exception as exc:
             print(f"[Cache] Failed to load {self._cache_file_gz}: {exc}")
@@ -287,27 +302,42 @@ class TelegramManager:
         if not isinstance(media, MessageMediaDocument):
             return None
         doc = getattr(media, "document", None)
-        if not doc or not is_audio_document(doc):
+        if not doc:
             return None
 
+        # Single-pass attribute extraction
         attrs = getattr(doc, "attributes", []) or []
-        audio_attr: Optional[DocumentAttributeAudio] = next(
-            (a for a in attrs if isinstance(a, DocumentAttributeAudio)), None
-        )
-        filename_attr: Optional[DocumentAttributeFilename] = next(
-            (a for a in attrs if isinstance(a, DocumentAttributeFilename)), None
-        )
+        audio_attr: Optional[DocumentAttributeAudio] = None
+        filename_attr: Optional[DocumentAttributeFilename] = None
+        for a in attrs:
+            if isinstance(a, DocumentAttributeAudio):
+                audio_attr = a
+            elif isinstance(a, DocumentAttributeFilename):
+                filename_attr = a
 
         file_name = filename_attr.file_name if filename_attr and filename_attr.file_name else f"track_{msg.id}"
         ext = file_name.split(".")[-1].lower() if "." in file_name else ""
-        fallback_title = re.sub(r"\.[^.]+$", "", file_name)
+        mime = (getattr(doc, "mime_type", "") or "audio/mpeg").lower()
 
+        # Reject video containers
+        if mime.startswith("video/") or ext in {"mp4", "mkv", "avi", "mov", "webm", "flv"}:
+            return None
+
+        is_audio = (
+            mime.startswith("audio/")
+            or mime in {"application/ogg", "application/x-flac"}
+            or ext in AUDIO_EXTENSIONS
+            or audio_attr is not None
+        )
+        if not is_audio:
+            return None
+
+        fallback_title = re.sub(r"\.[^.]+$", "", file_name)
         title = audio_attr.title.strip() if audio_attr and audio_attr.title else fallback_title
         artist = audio_attr.performer.strip() if audio_attr and audio_attr.performer else "Unknown Artist"
         duration = round(audio_attr.duration) if audio_attr and audio_attr.duration else None
 
         msg_text = getattr(msg, "message", "") or ""
-        mime = getattr(doc, "mime_type", "") or "audio/mpeg"
         file_size = int(getattr(doc, "size", 0) or 0)
         has_artwork = bool(getattr(doc, "thumbs", None))
 
@@ -387,15 +417,19 @@ class TelegramManager:
                 seen_ids: set[str] = set()
                 existing_map = {str(t["id"]): t for t in self.track_index}
 
-                async for msg in self.client.iter_messages(self.channel_entity, reverse=True):
+                async for msg in self.client.iter_messages(self.channel_entity, reverse=True, wait_time=0):
                     msg_id_str = str(msg.id)
                     if msg_id_str in seen_ids:
                         continue
                     seen_ids.add(msg_id_str)
 
+                    # Fast-path: non-document messages cannot be audio tracks
+                    media = getattr(msg, "media", None)
+                    if not isinstance(media, MessageMediaDocument):
+                        continue
+
                     # Cache media in user media cache
-                    if getattr(msg, "media", None):
-                        await self.media_cache.set(msg_id_str, msg.media)
+                    await self.media_cache.set(msg_id_str, media)
 
                     # Reuse existing parsed metadata when available
                     if msg_id_str in existing_map:
@@ -421,6 +455,7 @@ class TelegramManager:
 
                 # Commit new_index and persist cache only after successful completion
                 self.track_index = new_index
+                self._track_map = {str(t["id"]): t for t in self.track_index if "id" in t}
                 await self.save_cache()
                 self.register_event_handler()
                 print(f"[Indexer] Indexing complete: {len(self.track_index)} tracks loaded.")

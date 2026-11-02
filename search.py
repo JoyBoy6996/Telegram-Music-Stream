@@ -43,7 +43,7 @@ class SearchEngine:
         self._tracks_by_id: dict[str, dict[str, Any]] = {}
 
     def _ensure_search_words(self) -> None:
-        """Lazily build _search_words, inverted index, and ID lookup on first search."""
+        """Lazily build _search_words, precomputed search fields, inverted index, and ID lookup on first search."""
         if self._initialized:
             return
 
@@ -55,16 +55,25 @@ class SearchEngine:
             self._tracks_by_id[track_id] = track
             self._tracks_by_id[track["id"]] = track
 
+            title = track.get("title", "")
+            title_lower = (title or "").strip().lower()
+            title_core = extract_core_title(title_lower)
+            title_tokens = frozenset(tokenize(title_lower))
+            artist_tokens = frozenset(tokenize(track.get("artist")))
+
+            track["_title_lower"] = title_lower
+            track["_title_core"] = title_core
+            track["_title_tokens"] = title_tokens
+            track["_artist_tokens"] = artist_tokens
+
             if "_search_words" not in track:
-                title = track.get("title", "")
-                artist = track.get("artist", "")
                 album = track.get("album", "")
                 isrc = track.get("isrc", "")
 
                 words: set[str] = set()
-                words.update(tokenize(title))
-                words.update(tokenize(extract_core_title(title)))
-                words.update(tokenize(artist))
+                words.update(title_tokens)
+                words.update(tokenize(title_core))
+                words.update(artist_tokens)
                 words.update(tokenize(album))
                 if isrc:
                     words.add(str(isrc).lower().strip())
@@ -103,6 +112,7 @@ class SearchEngine:
         if not query_tokens:
             return self.track_index[:20]
 
+        query_tokens_set = frozenset(query_tokens)
         query_core = extract_core_title(clean_query)
 
         # Phase 1: Tiered Inverted Index Token Filter
@@ -113,6 +123,8 @@ class SearchEngine:
             tok = query_tokens[0]
             if tok in self._inverted:
                 candidate_ids = set(self._inverted[tok])
+            else:
+                return []
         else:
             # 1. Try strict intersection of ALL tokens first
             if all(tok in self._inverted for tok in query_tokens):
@@ -133,20 +145,38 @@ class SearchEngine:
                 if matching_sets:
                     candidate_ids = set.union(*matching_sets)
 
-        # 4. If still empty: use full track_index as candidates
-        if candidate_ids:
+        # 4. If still empty: avoid full-library scan if query tokens don't exist in inverted index
+        if not candidate_ids:
+            if not any(tok in self._inverted for tok in query_tokens):
+                return []
+            pool = self.track_index
+        else:
             candidates = [self._tracks_by_id[tid] for tid in candidate_ids if tid in self._tracks_by_id]
             pool = candidates if candidates else self.track_index
-        else:
-            pool = self.track_index
 
         # Phase 2: Scoring
         scored: list[tuple[int, bool, dict[str, Any]]] = []
         for track in pool:
-            title = (track.get("title") or "").strip().lower()
-            title_core = extract_core_title(title)
-            title_tokens = set(tokenize(title))
-            artist_tokens = set(tokenize(track.get("artist")))
+            title = track.get("_title_lower")
+            if title is None:
+                title = (track.get("title") or "").strip().lower()
+                track["_title_lower"] = title
+
+            title_core = track.get("_title_core")
+            if title_core is None:
+                title_core = extract_core_title(title)
+                track["_title_core"] = title_core
+
+            title_tokens = track.get("_title_tokens")
+            if title_tokens is None:
+                title_tokens = frozenset(tokenize(title))
+                track["_title_tokens"] = title_tokens
+
+            artist_tokens = track.get("_artist_tokens")
+            if artist_tokens is None:
+                artist_tokens = frozenset(tokenize(track.get("artist")))
+                track["_artist_tokens"] = artist_tokens
+
             track_words = track.get("_search_words", frozenset())
             if not isinstance(track_words, (set, frozenset)):
                 track_words = frozenset(track_words) if track_words else frozenset()
@@ -166,11 +196,11 @@ class SearchEngine:
                 score += 7
 
             # +5 all query tokens found in title tokens
-            if title_tokens and all(q_tok in title_tokens for q_tok in query_tokens):
+            if title_tokens and query_tokens_set.issubset(title_tokens):
                 score += 5
 
             # +3 artist match
-            if artist_tokens and any(q_tok in artist_tokens for q_tok in query_tokens):
+            if artist_tokens and not query_tokens_set.isdisjoint(artist_tokens):
                 score += 3
 
             # +2 duration within 3 seconds of target
