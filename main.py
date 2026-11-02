@@ -59,7 +59,8 @@ def get_session_key(request: Request) -> str:
 # RAM limits configuration
 FAST_START_BYTES = 512 * 1024       # 512 KB
 TAG_SLICE_BYTES = 256 * 1024        # 256 KB
-REQUEST_CHUNK_SIZE = 256 * 1024     # 256 KB
+REQUEST_CHUNK_SIZE = 512 * 1024     # 512 KB (MAX_CHUNK_SIZE for high throughput)
+CHUNK_ALIGNMENT = 4096              # 4 KB Telegram MTProto alignment (minimizes discarded seek bytes)
 RANGE_REGEX = re.compile(r"^bytes=(\d*)-(\d*)$")
 
 # Bounded for 1 GB RAM VPS: entry limits + explicit byte caps (~24 MB total RAM max)
